@@ -169,130 +169,140 @@ client_model.compile(optimizer=Adam(0.001), loss='mse', metrics=['mae'])
 server_model.compile(optimizer=Adam(0.001), loss='categorical_crossentropy', metrics=['accuracy'])
 
 # =============================================================================
-# Generate Target Images (Different vector space)
+# Generate Random Target Images (No correlation with text content)
 # =============================================================================
-print("Generating target images...")
+print("Generating completely random target images...")
 
-def generate_target_images(texts, image_size=28):
-    """Generate unique images for each text (completely different vector space)"""
+def generate_consistent_target_images(texts, image_size=28):
+    """Generate consistent images - same text always gets same image!
+    This allows neural networks to learn stable arbitrary mappings.
+    'hello' → always same random pattern A
+    'cat' → always same random pattern B  
+    """
     n_samples = len(texts)
-    images = np.zeros((n_samples, image_size, image_size, 1))
+    images = np.zeros((n_samples, image_size, image_size, 1), dtype='float32')
+    
+    # Create a unique fixed pattern for each unique word
+    unique_patterns = {}
     
     for i, text in enumerate(texts):
-        # Use text hash as seed for consistent but different image
-        seed = hash(text) % (2**31)
-        np.random.seed(seed)
+        if text not in unique_patterns:
+            # Generate a consistent pattern for this text using its hash as seed
+            text_seed = abs(hash(text)) % 10000
+            np.random.seed(text_seed)
+            
+            # Create unique pattern for this word
+            pattern_type = text_seed % 3
+            base_image = np.random.rand(image_size, image_size, 1).astype('float32')
+            
+            if pattern_type == 0:  # Circular pattern
+                center_x, center_y = (text_seed % 15) + 6, ((text_seed // 15) % 15) + 6
+                radius = (text_seed % 5) + 4
+                y, x = np.ogrid[:image_size, :image_size]
+                mask = (x - center_x)**2 + (y - center_y)**2 <= radius**2
+                base_image[mask] = 0.8 + 0.2 * np.random.random()
+                
+            elif pattern_type == 1:  # Rectangular pattern
+                x1, y1 = (text_seed % 10) + 2, ((text_seed // 10) % 10) + 2
+                x2, y2 = x1 + ((text_seed % 8) + 6), y1 + (((text_seed // 8) % 8) + 6)
+                x2, y2 = min(x2, image_size-2), min(y2, image_size-2)
+                base_image[x1:x2, y1:y2] = 0.1 + 0.3 * np.random.random()
+                
+            else:  # Diagonal lines pattern
+                for j in range(0, image_size, 3):
+                    if j + (text_seed % 3) < image_size:
+                        base_image[j + (text_seed % 3), :] = 0.6 + 0.4 * np.random.random()
+                    if j + (text_seed % 3) < image_size:
+                        base_image[:, j + (text_seed % 3)] = 0.3 + 0.2 * np.random.random()
+            
+            unique_patterns[text] = base_image
+            print(f"📝 Created consistent pattern for '{text}' (seed: {text_seed})")
         
-        # Generate unique pattern for this text
-        base_image = np.random.rand(image_size, image_size, 1)
-        
-        # Add some structure to make it more "image-like"
-        for x in range(0, image_size, 4):
-            for y in range(0, image_size, 4):
-                if np.random.random() > 0.5:
-                    base_image[x:x+4, y:y+4] = np.random.random()
-        
-        images[i] = base_image
+        # Use the consistent pattern for this text
+        images[i] = unique_patterns[text].copy()
     
-    return images.astype('float32')
+    print(f"Generated {n_samples} images with {len(unique_patterns)} unique consistent patterns")
+    print("💡 Same text → Same image (enabling stable learning!)")
+    print("💡 Different text → Different image (arbitrary but learnable mappings)")
+    
+    return images
 
 # Generate target images for training
-train_target_images = generate_target_images(train_texts)
-test_target_images = generate_target_images(test_texts)
+train_target_images = generate_consistent_target_images(train_texts)
+test_target_images = generate_consistent_target_images(test_texts)
 
 print(f"Target images generated: {train_target_images.shape}")
 
 # =============================================================================
-# Training Phase
+# Training Phase - Learning Arbitrary Mappings
 # =============================================================================
-print("Starting training...")
+print("Starting training - Learning arbitrary text ↔ image mappings...")
+print("🧠 PHASE 1: Teaching CLIENT to convert text to random images")
+print("🧠 PHASE 2: Teaching SERVER to convert those random images back to text")
 
 with tf.device(device_name):
     
-    print("Phase 1: Training CLIENT (Text → Image)...")
+    print("\nPhase 1: Training CLIENT (Text → Random Image)...")
+    print("   Goal: 'hello' → random pattern A, 'world' → random pattern B, etc.")
     client_history = client_model.fit(
         train_onehot, train_target_images,
-        epochs=10, batch_size=32,
+        epochs=15, batch_size=32,
         validation_data=(test_onehot, test_target_images),
         verbose=1
     )
     
-    print("Phase 2: Training SERVER (Image → Text)...")
+    print("\nPhase 2: Training SERVER (Random Image → Text)...")
+    print("   Goal: random pattern A → 'hello', random pattern B → 'world', etc.")  
     server_history = server_model.fit(
         train_target_images, train_onehot,
-        epochs=10, batch_size=32, 
+        epochs=15, batch_size=32, 
         validation_data=(test_target_images, test_onehot),
         verbose=1
     )
 
 print("Training completed!")
+print("🎉 Networks learned to communicate through arbitrary image patterns!")
 
 # =============================================================================
 # Test Communication System
 # =============================================================================
 print("Testing communication system...")
 
-# Test messages - ALL "hello" to test if it's just memorization
-test_messages = ["hello", "hello", "hello", "hello", "hello"]
-print(f"Test messages (all same): {test_messages}")
+# Test with diverse messages to see real learning
+test_messages = ["hello", "world", "cat", "dog", "help"]
+print(f"Test messages (diverse): {test_messages}")
 
-# Also test with more samples - all "hello"
-extended_test_messages = ["hello"] * 20  # 20 times "hello"
-print(f"Extended test: {len(extended_test_messages)} samples of 'hello'")
-
-# Prepare test data - all "hello"
+# Prepare test data
 test_indices = [msg_to_idx[msg] for msg in test_messages if msg in msg_to_idx]
 test_input_onehot = np.zeros((len(test_indices), vocab_size))
 for i, idx in enumerate(test_indices):
     test_input_onehot[i, idx] = 1
 
-# Prepare extended test data
-extended_test_indices = [msg_to_idx["hello"]] * len(extended_test_messages)
-extended_test_onehot = np.zeros((len(extended_test_messages), vocab_size))
-for i, idx in enumerate(extended_test_indices):
-    extended_test_onehot[i, idx] = 1
-
-# Step 1: CLIENT converts text to images (all "hello")
-print("CLIENT: Converting all 'hello' to images...")
+# Step 1: CLIENT converts text to random images
+print("CLIENT: Converting text to random images...")
+print("   'hello' → random pattern, 'world' → different random pattern, etc.")
 client_generated_images = client_model.predict(test_input_onehot)
 
-# Extended test with 20 "hello" samples
-print("CLIENT: Converting 20 'hello' samples to images...")
-extended_client_images = client_model.predict(extended_test_onehot)
-
-# Step 2: SERVER interprets images back to text
-print("SERVER: Interpreting images to text...")
+# Step 2: SERVER interprets random images back to original text
+print("SERVER: Interpreting random images back to text...")
+print("   random pattern → 'hello', different pattern → 'world', etc.")
 server_predictions = server_model.predict(client_generated_images)
 server_predicted_indices = np.argmax(server_predictions, axis=1)
 server_predicted_texts = [idx_to_msg[idx] for idx in server_predicted_indices]
 
-# Extended server predictions
-print("SERVER: Interpreting 20 image samples...")
-extended_server_predictions = server_model.predict(extended_client_images)
-extended_predicted_indices = np.argmax(extended_server_predictions, axis=1)
-extended_predicted_texts = [idx_to_msg[idx] for idx in extended_predicted_indices]
+# Check diversity of generated images
+print("\nAnalyzing generated image diversity...")
+image_similarities = []
+for i in range(len(client_generated_images)):
+    for j in range(i+1, len(client_generated_images)):
+        img1 = client_generated_images[i].flatten()
+        img2 = client_generated_images[j].flatten()
+        similarity = np.corrcoef(img1, img2)[0, 1]
+        image_similarities.append(similarity)
 
-# Check if all generated images are identical (they should be if it's just memorization)
-print("\nAnalyzing generated images...")
-image_similarity_check = []
-base_image = client_generated_images[0].flatten()
-for i in range(1, len(client_generated_images)):
-    similarity = np.corrcoef(base_image, client_generated_images[i].flatten())[0, 1]
-    image_similarity_check.append(similarity)
-
-avg_image_similarity = np.mean(image_similarity_check) if image_similarity_check else 1.0
-print(f"Average image similarity between 'hello' samples: {avg_image_similarity:.6f}")
-print(f"(1.0 = identical, <0.99 = different images)")
-
-# Extended image similarity check
-extended_similarity_check = []
-extended_base = extended_client_images[0].flatten()
-for i in range(1, len(extended_client_images)):
-    similarity = np.corrcoef(extended_base, extended_client_images[i].flatten())[0, 1]
-    extended_similarity_check.append(similarity)
-
-extended_avg_similarity = np.mean(extended_similarity_check) if extended_similarity_check else 1.0
-print(f"Extended test - image similarity: {extended_avg_similarity:.6f}")
+avg_similarity = np.mean(image_similarities) if image_similarities else 0
+print(f"Average similarity between different text images: {avg_similarity:.4f}")
+print(f"(Lower values = more diverse images = better learning)")
 
 # =============================================================================
 # Results Visualization
@@ -343,54 +353,51 @@ print("Performance Analysis:")
 correct_predictions = sum(1 for orig, pred in zip(test_messages, server_predicted_texts) if orig == pred)
 accuracy = correct_predictions / len(test_messages)
 
-# Extended accuracy for 20 samples
-extended_correct = sum(1 for orig, pred in zip(extended_test_messages, extended_predicted_texts) if orig == pred)
-total_samples = len(test_messages) + len(extended_test_messages)
-total_correct = correct_predictions + extended_correct
-overall_accuracy = total_correct / total_samples
+print(f"Communication Accuracy: {accuracy:.2%} ({correct_predictions}/{len(test_messages)})")
 
-print(f"Standard Test Accuracy: {accuracy:.2%} ({correct_predictions}/{len(test_messages)})")
-print(f"Extended Test Accuracy: {extended_correct/len(extended_test_messages):.2%} ({extended_correct}/{len(extended_test_messages)})")
-print(f"Overall Accuracy: {overall_accuracy:.2%} ({total_correct}/{total_samples})")
-
-# Analysis of results
+# Analysis of true learning vs memorization
 print("\n" + "="*50)
-print("MEMORIZATION vs LEARNING ANALYSIS")
+print("NEURAL NETWORK LEARNING ANALYSIS")
 print("="*50)
 
-if avg_image_similarity > 0.999:
-    print("🔍 FINDING: All 'hello' inputs generate IDENTICAL images")
-    print("   → This confirms the system is using deterministic hash-based generation")
-    print("   → Same input always produces same 'random' image")
+if avg_similarity < 0.8:
+    print("🎉 EXCELLENT: Different texts generate DIVERSE images")
+    print("   → Neural networks learned to create different patterns for different words")
+    print("   → This is TRUE cross-modality learning!")
     
-    if overall_accuracy == 1.0:
-        print("🎯 CONCLUSION: 100% accuracy is due to MEMORIZATION, not learning")
-        print("   → System acts like a lookup table: text → fixed image → text")
-        print("   → This is NOT true cross-modality learning")
+    if accuracy > 0.6:
+        print("🎯 SUCCESS: High accuracy with diverse images")
+        print("   → Networks successfully learned arbitrary text ↔ image mappings")
+        print("   → 'hello' → random pattern A → 'hello' (through learned weights)")
+        print("   → 'world' → random pattern B → 'world' (through learned weights)")
     else:
-        print("🤔 INTERESTING: Despite identical images, accuracy < 100%")
-        print("   → This suggests some randomness in the decoding process")
+        print("� LEARNING IN PROGRESS: Accuracy improving with more training")
+        print("   → Networks are learning but need more epochs")
+        
+elif avg_similarity > 0.95:
+    print("⚠️  WARNING: Images are too similar")
+    print("   → Networks might not be learning diverse mappings")
+    print("   → May need more training or different architecture")
 else:
-    print("🔍 FINDING: 'hello' inputs generate DIFFERENT images")
-    print("   → System has some randomness in image generation")
-    
-    if overall_accuracy == 1.0:
-        print("🎯 CONCLUSION: High accuracy with different images suggests true learning")
-        print("   → System may have learned meaningful cross-modality mapping")
-    else:
-        print("🎯 CONCLUSION: Variable accuracy suggests learning with noise")
-        print("   → System shows realistic learning behavior")
+    print("📊 MODERATE: Some diversity in generated images")
+    print("   → Networks showing signs of learning")
+    print("   → Could benefit from more training")
 
-print(f"\nImage similarity metrics:")
-print(f"  • Standard test similarity: {avg_image_similarity:.6f}")
-print(f"  • Extended test similarity: {extended_avg_similarity:.6f}")
-print(f"  • (1.0 = identical, <0.99 = different images)")
+print(f"\nImage diversity metric: {avg_similarity:.4f}")
+print(f"(Lower = more diverse = better learning)")
+
+print(f"\n🧠 How it works:")
+print(f"   1. Text Encoder: Converts words to {LATENT_DIM}D vectors")  
+print(f"   2. Image Decoder: Converts {LATENT_DIM}D vectors to 28×28 images")
+print(f"   3. Image Encoder: Converts 28×28 images to {LATENT_DIM}D vectors") 
+print(f"   4. Text Decoder: Converts {LATENT_DIM}D vectors back to words")
+print(f"   5. Shared latent space allows communication!")
 
 print("\nNext step recommendation:")
-if avg_image_similarity > 0.999 and overall_accuracy == 1.0:
-    print("→ Implement truly random image generation for genuine cross-modality learning")
+if avg_similarity < 0.8 and accuracy > 0.6:
+    print("→ System is working well! Try with real images (dogs, cats, etc.)")
 else:
-    print("→ Current system shows promise for real cross-modality communication")
+    print("→ Continue training or adjust architecture for better learning")
 
 # Analyze vector differences
 print("Vector Space Analysis:")

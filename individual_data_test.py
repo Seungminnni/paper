@@ -1598,183 +1598,56 @@ if gpu_available:
 else:
     print("⚠️  Using CPU - this will be slow for full dataset")
 
-# Load FULL dataset for integrated training
-print("\n🚀 STARTING INTEGRATED 19-COLUMN VOTER DATA TRAINING")
-print("="*80)
+# Load FULL dataset for comprehensive training
+individual_data, df = load_specific_csv_data('ncvotera.csv', max_rows=None)  # Load ALL rows
 
-df, available_columns = load_integrated_csv_data('ncvotera.csv', max_rows=1000)  # Load integrated data
-
-if df is None:
-    print("❌ Failed to load integrated data")
+if individual_data is None:
+    print("❌ Failed to load individual data")
     exit(1)
 
-print(f"\n📊 Integrated data loaded:")
-print(f"   Records: {len(df):,}")
-print(f"   Available columns: {len(available_columns)}/19")
-print(f"   Columns: {available_columns}")
+print(f"\n📊 Individual data categories found:")
+for category, items in individual_data.items():
+    print(f"   {category}: {len(items)} unique items")
 
-# Create integrated feature vectors and images
-print("\n🔧 Processing integrated records...")
-integrated_vectors, text_labels, vocabularies, total_vocab_size = create_integrated_record_vectors(df, available_columns)
-integrated_images = generate_integrated_record_images(df, available_columns, image_size=64)
+# Test each category of individual items
+results = []
+all_training_histories = []
+all_categories = []
 
-print(f"\n📊 Integrated data prepared:")
-print(f"   Feature vectors: {integrated_vectors.shape}")
-print(f"   Images: {integrated_images.shape}")
-print(f"   Total vocabulary size: {total_vocab_size}")
+for category, items_list in individual_data.items():
+    if len(items_list) >= 2:  # Only test if enough items
+        try:
+            result = test_individual_items(category, items_list)
+            if result:
+                results.append(result)
+                all_categories.append(category)
+                # Store both client and server histories
+                if 'client_history' in result and 'server_history' in result:
+                    all_training_histories.append(result['client_history'])
+                    all_training_histories.append(result['server_history'])
+        except Exception as e:
+            print(f"❌ Error testing {category}: {e}")
 
-# Build integrated models
-print("\n🏗️ Building integrated models...")
-client_model, server_model, text_encoder, image_generator, image_encoder, text_decoder = build_integrated_record_models(
-    vocab_size=total_vocab_size,
-    latent_dim=128,
-    image_size=64,
-    learning_rate=0.0005
-)
-
-# Training setup
-print("\n🎯 Starting integrated training...")
-batch_size = 32
-epochs = 50
-
-# Split data
-split_idx = int(0.8 * len(integrated_vectors))
-train_vectors = integrated_vectors[:split_idx]
-train_images = integrated_images[:split_idx]
-test_vectors = integrated_vectors[split_idx:]
-test_images = integrated_images[split_idx:]
-
-print(f"Training data: {len(train_vectors)} records")
-print(f"Test data: {len(test_vectors)} records")
-
-# Train CLIENT model (Text → Image)
-print("\n🔧 Training CLIENT model (Text → Image)...")
-client_callbacks = [
-    ReduceLROnPlateau(monitor='loss', factor=0.7, patience=5, min_lr=1e-6, verbose=1),
-    EarlyStopping(monitor='loss', patience=10, restore_best_weights=True, verbose=1)
-]
-
-client_history = client_model.fit(
-    train_vectors, train_images,
-    batch_size=batch_size,
-    epochs=epochs,
-    validation_split=0.2,
-    callbacks=client_callbacks,
-    verbose=1
-)
-
-# Train SERVER model (Image → Text)
-print("\n🔧 Training SERVER model (Image → Text)...")
-server_callbacks = [
-    ReduceLROnPlateau(monitor='accuracy', factor=0.7, patience=5, min_lr=1e-6, verbose=1),
-    EarlyStopping(monitor='accuracy', patience=10, restore_best_weights=True, verbose=1)
-]
-
-server_history = server_model.fit(
-    train_images, train_vectors,
-    batch_size=batch_size,
-    epochs=epochs,
-    validation_split=0.2,
-    callbacks=server_callbacks,
-    verbose=1
-)
-
-# Test the integrated communication
-print("\n🧪 Testing integrated communication...")
-test_idx = np.random.randint(0, len(test_vectors))
-original_vector = test_vectors[test_idx:test_idx+1]
-original_label = text_labels[split_idx + test_idx]
-
-# CLIENT: Text → Image
-generated_image = client_model.predict(original_vector, verbose=0)
-
-# SERVER: Image → Text  
-reconstructed_vector = server_model.predict(generated_image, verbose=0)
-
-# Calculate accuracy
-vector_similarity = np.dot(original_vector.flatten(), reconstructed_vector.flatten()) / (
-    np.linalg.norm(original_vector.flatten()) * np.linalg.norm(reconstructed_vector.flatten())
-)
-
-print(f"\n📊 INTEGRATED COMMUNICATION TEST RESULTS:")
-print(f"   Vector similarity: {vector_similarity:.4f}")
-print(f"   Original record: {original_label[:200]}...")
-
-# Decode reconstructed vector to readable format
-reconstructed_features = []
-offset = 0
-for col in available_columns:
-    if col in vocabularies:
-        col_size = len(vocabularies[col])
-        col_probs = reconstructed_vector[0][offset:offset+col_size]
-        best_idx = np.argmax(col_probs)
+# 🎯 Create comprehensive training dashboard
+if results and all_training_histories:
+    print(f"\n{'='*80}")
+    print("🎨 CREATING COMPREHENSIVE TRAINING DASHBOARD")
+    print(f"{'='*80}")
+    
+    try:
+        # Create interactive dashboard
+        dashboard_fig = create_interactive_training_dashboard(all_training_histories, all_categories)
+        print("✅ Interactive dashboard created successfully!")
         
-        # Find the value corresponding to this index
-        for val, idx in vocabularies[col].items():
-            if idx == best_idx:
-                reconstructed_features.append(f"{col}:{val}")
-                break
+        # Create summary visualization
+        plt.figure(figsize=(16, 12))
         
-        offset += col_size
-
-reconstructed_label = " | ".join(reconstructed_features)
-print(f"   Reconstructed: {reconstructed_label[:200]}...")
-
-# Create visualization
-print("\n📊 Creating training visualizations...")
-fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-fig.suptitle('Integrated 19-Column Voter Data Training Results', fontsize=16, fontweight='bold')
-
-# CLIENT training history
-axes[0, 0].plot(client_history.history['loss'], label='Training Loss', color='blue')
-axes[0, 0].plot(client_history.history['val_loss'], label='Validation Loss', color='orange')
-axes[0, 0].set_title('CLIENT Model: Text → Image')
-axes[0, 0].set_xlabel('Epoch')
-axes[0, 0].set_ylabel('Loss')
-axes[0, 0].legend()
-axes[0, 0].grid(True)
-
-# SERVER training history
-axes[0, 1].plot(server_history.history['accuracy'], label='Training Accuracy', color='green')
-axes[0, 1].plot(server_history.history['val_accuracy'], label='Validation Accuracy', color='red')
-axes[0, 1].set_title('SERVER Model: Image → Text')
-axes[0, 1].set_xlabel('Epoch')
-axes[0, 1].set_ylabel('Accuracy')
-axes[0, 1].legend()
-axes[0, 1].grid(True)
-
-# Original image sample
-original_image = integrated_images[split_idx + test_idx]
-axes[0, 2].imshow(original_image)
-axes[0, 2].set_title('Original Integrated Pattern')
-axes[0, 2].axis('off')
-
-# Generated image
-axes[1, 0].imshow(generated_image[0])
-axes[1, 0].set_title('CLIENT Generated Image')
-axes[1, 0].axis('off')
-
-# Feature vector visualization
-axes[1, 1].bar(range(min(50, len(original_vector[0]))), original_vector[0][:50])
-axes[1, 1].set_title('Original Feature Vector (first 50 dims)')
-axes[1, 1].set_xlabel('Feature Index')
-axes[1, 1].set_ylabel('Value')
-
-# Reconstructed vector visualization
-axes[1, 2].bar(range(min(50, len(reconstructed_vector[0]))), reconstructed_vector[0][:50])
-axes[1, 2].set_title('Reconstructed Vector (first 50 dims)')
-axes[1, 2].set_xlabel('Feature Index')
-axes[1, 2].set_ylabel('Probability')
-
-plt.tight_layout()
-plt.savefig('integrated_voter_training_results.png', dpi=300, bbox_inches='tight')
-plt.show()
-
-print(f"\n✅ INTEGRATED TRAINING COMPLETE!")
-print(f"   CLIENT Loss: {client_history.history['loss'][-1]:.6f}")
-print(f"   SERVER Accuracy: {server_history.history['accuracy'][-1]:.6f}")
-print(f"   Communication Similarity: {vector_similarity:.4f}")
-print(f"   📁 Results saved to: integrated_voter_training_results.png")
+        # Create a comprehensive summary plot
+        gs = plt.GridSpec(3, 3, figure=plt.gcf())
+        
+        # Plot 1: Accuracy by category
+        ax1 = plt.subplot(gs[0, :2])
+        categories = [r['category'] for r in results]
         accuracies = [r['accuracy'] for r in results]
         colors = plt.cm.Set3(np.linspace(0, 1, len(categories)))
         

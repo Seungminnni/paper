@@ -13,12 +13,17 @@ import tensorflow as tf
 from tensorflow.keras.layers import *
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
+try:
+    from tensorflow.keras.optimizers import AdamW
+except Exception:
+    from tensorflow.keras.optimizers.experimental import AdamW
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 import time
 from datetime import datetime
+import math
 
 # -----------------------------------
 # Word2Vec processor (간단 버전)
@@ -43,6 +48,8 @@ def residual_block(x, filters, kernel_size=3):
 # -----------------------------------
 def se_block(x, reduction=16):
     filters = x.shape[-1]
+    if filters is None:
+        filters = tf.shape(x)[-1]
     se = GlobalAveragePooling2D()(x)
     se = Dense(filters // reduction, activation='relu')(se)
     se = Dense(filters, activation='sigmoid')(se)
@@ -123,7 +130,7 @@ def build_autoencoder(input_shape):
     # Full autoencoder (L2 정규화 추가)
     autoencoder = Model(inputs, decoded)
     autoencoder.compile(
-        optimizer=Adam(learning_rate=5e-4, weight_decay=1e-4),  # Weight decay 추가
+        optimizer=AdamW(learning_rate=5e-4, weight_decay=1e-4),
         loss='mse'
     )
     
@@ -164,8 +171,8 @@ def build_residual_attention_cnn(input_shape, output_size):
     model = Model(inputs, outputs)
     # 더 높은 학습률로 조정
     model.compile(
-        optimizer=Adam(learning_rate=5e-4, weight_decay=1e-5), 
-        loss="mse", 
+        optimizer=AdamW(learning_rate=5e-4, weight_decay=1e-5),
+        loss="mse",
         metrics=["mae"]
     )
     return model
@@ -200,31 +207,31 @@ def load_text_data(max_samples=10000):
     print(f"   Sample text: '{texts[0]}'")
     return texts
 
-def generate_mosaic(texts, vector_size=256, target_samples=None):
-    """텍스트를 모자이크 이미지로 변환"""
-    print(f"🎨 Generating mosaic from {len(texts)} texts...")
-    processor = SimpleWord2VecProcessor(vector_size=vector_size)
-    vectors = processor.train_and_vectorize(texts)
-    
-    # 정규화
-    vectors = (vectors - vectors.min()) / (vectors.max() - vectors.min() + 1e-8)
-    
-    # target_samples가 지정되면 패딩/자르기로 크기 맞춤
-    if target_samples and len(texts) != target_samples:
-        if len(texts) < target_samples:
-            # 패딩
-            padding_needed = target_samples - len(texts)
-            padding = np.zeros((padding_needed, vector_size))
-            vectors = np.vstack([vectors, padding])
-        else:
-            # 자르기
-            vectors = vectors[:target_samples]
-        print(f"   Adjusted to {target_samples} samples")
-    
-    # 4D 텐서로 변환: (1, samples, vector_size, 1)
-    mosaic = vectors.reshape(1, vectors.shape[0], vector_size, 1)
-    print(f"   Mosaic shape: {mosaic.shape}")
-    return mosaic, vectors
+def generate_mosaic(texts, processor, vector_size=256):
+    """텍스트를 모자이크 이미지(샘플별 작은 이미지)로 변환
+    - 반환 X: (N, H, W, C)
+    - 반환 vectors: (N, vector_size)
+    - processor: 사전에 학습된 SimpleWord2VecProcessor
+    """
+    print(f"🎨 Generating per-sample mosaic from {len(texts)} texts...")
+    if hasattr(processor, "vectorize"):
+        vectors = processor.vectorize(texts)
+    else:
+        print("⚠️ processor.vectorize() not found; falling back to train_and_vectorize(). This may be slower.")
+        vectors = processor.train_and_vectorize(texts)
+
+    # 정규화 (샘플별 min-max가 아닌 전체 min-max로 고정)
+    vmin, vmax = vectors.min(), vectors.max()
+    vectors = (vectors - vmin) / (vmax - vmin + 1e-8)
+
+    # 벡터를 정사각 이미지로 reshape (예: 256D -> 16x16x1)
+    side = int(math.sqrt(vector_size))
+    assert side * side == vector_size, "vector_size는 완전제곱수여야 합니다. 예: 256=16x16"
+    N = vectors.shape[0]
+    X = vectors.reshape(N, side, side, 1)
+    print(f"   Mosaic batch shape: {X.shape} (N,H,W,C)")
+
+    return X, vectors
 
 # -----------------------------------
 # Evaluation Metrics
@@ -380,6 +387,16 @@ Generalization:
 # -----------------------------------
 # Main Test Function with Comprehensive Evaluation
 # -----------------------------------
+# -----------------------------------
+# Main Test Function with Comprehensive Evaluation
+# -----------------------------------
+def fit_word2vec_processor(all_texts, vector_size=256):
+    print(f"🧩 Fitting Word2Vec processor on {len(all_texts)} texts (once, shared for train/val)...")
+    processor = SimpleWord2VecProcessor(vector_size=vector_size)
+    # train_and_vectorize는 벡터를 바로 반환하므로 여기서는 내부 모델만 학습시키기 위해 한 번 호출 후 저장
+    _ = processor.train_and_vectorize(all_texts)
+    return processor
+
 def test_pipeline():
     """메인 테스트 파이프라인 - 개선된 평가 시스템"""
     print("🚀 Starting Comprehensive Training and Evaluation Pipeline")
@@ -387,24 +404,23 @@ def test_pipeline():
     
     start_time = time.time()
     
-    # 1. 데이터 로딩 및 분할 (7000 학습, 3000 검증)
+    # 1. 데이터 로딩
     texts = load_text_data(max_samples=10000)
-    
+
+    print(f"\n🧩 Fit shared text→vector processor")
+    processor = fit_word2vec_processor(texts, vector_size=256)
+
     print(f"\n📊 Data Split: 7,000 training / 3,000 validation")
     train_texts, val_texts = train_test_split(
         texts, train_size=7000, test_size=3000, random_state=42, shuffle=True
     )
-    
     print(f"   ✅ Actual split: {len(train_texts)} train, {len(val_texts)} validation")
-    
-    # 2. 모자이크 생성 (크기 통일)
-    print(f"\n🎨 Phase 1: Mosaic Generation")
-    # 7000 샘플로 크기 통일 (validation은 패딩됨)
-    train_mosaic, train_vec = generate_mosaic(train_texts, target_samples=7000)
-    val_mosaic, val_vec = generate_mosaic(val_texts, target_samples=7000)
-    
-    input_shape = train_mosaic.shape[1:]  # (samples, vector_size, 1)
-    
+
+    print(f"\n🎨 Phase 1: Mosaic Generation (per-sample)")
+    train_mosaic, train_vec = generate_mosaic(train_texts, processor=processor, vector_size=256)
+    val_mosaic, val_vec = generate_mosaic(val_texts, processor=processor, vector_size=256)
+
+    input_shape = train_mosaic.shape[1:]  # (H,W,C)
     print(f"   Input shape: {input_shape}")
     
     # 3. Autoencoder 압축 학습 (실제 압축이 가능한 버전)
@@ -440,43 +456,31 @@ def test_pipeline():
     original_size = np.prod(train_mosaic.shape[1:])
     compressed_size = np.prod(compressed_train.shape[1:])
     compression_ratio = original_size / compressed_size
+    print(f"   Per-sample sizes → original: {original_size}, compressed: {compressed_size}")
     print(f"   Compression ratio: {compression_ratio:.2f}:1")
     
     # 5. CNN 예측 학습 (데이터 증강 포함)
     print(f"\n🧠 Phase 4: CNN Prediction Training with Data Augmentation")
-    cnn = build_residual_attention_cnn(compressed_train.shape[1:], output_size=64)
-    
-    # 더 단순하고 효과적인 타깃 벡터 생성
-    def create_simple_target(vecs):
-        """단순화된 타깃 벡터 생성 - 더 학습하기 쉬운 형태"""
-        # 상위 64개 주성분 사용 (모델 출력과 맞춤)
-        mean_features = np.mean(vecs, axis=0)[:64]
-        # 정규화
-        mean_features = (mean_features - mean_features.min()) / (mean_features.max() - mean_features.min() + 1e-8)
-        return mean_features
-    
-    y_train = np.expand_dims(create_simple_target(train_vec), axis=0)
-    y_val = np.expand_dims(create_simple_target(val_vec), axis=0)
-    
-    print(f"   Target vector dimension: {y_train.shape[-1]} (simplified)")
-    
+    vector_size = train_vec.shape[1]
+    cnn = build_residual_attention_cnn(compressed_train.shape[1:], output_size=vector_size)
+
+    # 샘플별 타깃: 원래 텍스트 임베딩 그대로 회귀
+    y_train = train_vec  # (N, vector_size)
+    y_val = val_vec      # (N, vector_size)
+    print(f"   Target vector dimension: {vector_size} (per-sample regression to original embedding)")
+
     # 데이터 증강: 더 부드러운 증강 적용
     print("   Applying gentle data augmentation...")
-    augmented_train = [compressed_train]  # 원본 포함
+    augmented_train = [compressed_train]
     augmented_targets = [y_train]
-    
-    for i in range(2):  # 2개의 증강된 버전만 추가
-        noise_level = 0.001 * (i + 1)  # 매우 낮은 노이즈
+    for i in range(2):
+        noise_level = 0.001 * (i + 1)
         augmented_batch = compressed_train + np.random.normal(0, noise_level, compressed_train.shape)
         augmented_train.append(augmented_batch)
         augmented_targets.append(y_train)
-    
-    # 배치들을 결합
     X_train_aug = np.vstack(augmented_train)
     y_train_aug = np.vstack(augmented_targets)
-    
-    print(f"   Augmented training data shape: {X_train_aug.shape}")
-    print(f"   Augmented target shape: {y_train_aug.shape}")
+    print(f"   Augmented training data shape: {X_train_aug.shape}, targets: {y_train_aug.shape}")
     
     # CNN 콜백 설정 (더 관대한 조기 종료)
     cnn_callbacks = [
@@ -497,11 +501,11 @@ def test_pipeline():
     
     # 6. 최종 평가 및 Robustness 테스트
     print(f"\n📊 Phase 5: Comprehensive Evaluation with Robustness Analysis")
-    
+
     # 예측 수행
     train_pred = cnn.predict(compressed_train, verbose=0)
     val_pred = cnn.predict(compressed_val, verbose=0)
-    
+
     # 메트릭 계산
     train_metrics = calculate_metrics(y_train, train_pred, "Training")
     val_metrics = calculate_metrics(y_val, val_pred, "Validation")
@@ -575,8 +579,8 @@ def test_pipeline():
     print(f"{'='*70}")
     print(f"📊 Dataset: {len(texts)} samples ({len(train_texts)} train / {len(val_texts)} val)")
     print(f"🗜️ Compression: {compression_ratio:.1f}:1 ratio")
-    print(f"� Optimization: Batch size 8 + Data Augmentation + Low LR (0.0005)")
-    print(f"�📈 Training Performance:")
+    print(f"⚙️ Optimization: Batch size 8 + Data Augmentation + Low LR (0.0005)")
+    print(f"📈 Training Performance:")
     print(f"   • Correlation: {train_metrics['correlation']:.4f} ({train_metrics['correlation']*100:.1f}%)")
     print(f"   • R² Score: {train_metrics['r2']:.4f} ({train_metrics['r2']*100:.1f}%)")
     print(f"   • MAE: {train_metrics['mae']:.4f}")

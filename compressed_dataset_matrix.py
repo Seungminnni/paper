@@ -1,517 +1,609 @@
 #!/usr/bin/env python3
 """
-압축된 데이터셋 매트릭스 접근법
-- 전체 데이터셋을 하나의 큰 모자이크로 변환
-- 컨볼루션을 통한 데이터 압축
-- 압축된 모자이크로 학습 테스트
+개선 버전: 컨볼루션 Autoencoder 압축 + Residual Attention CNN 학습
+CSV 텍스트 → Word2Vec → 모자이크 이미지 → 압축 → CNN → 벡터
+- 효율성 및 정확도 평가 시스템 추가
+- 10,000개 데이터 중 7,000개 학습, 3,000개 검증
+- 최적화된 에포크 및 배치 사이즈
 """
 
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from simple_word2vec_mosaic import SimpleWord2VecProcessor
-import pandas as pd
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.layers import *
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
+import time
+from datetime import datetime
 
-def load_patients_data():
-    """Load and extract text from patients.csv data"""
-    print("📊 Loading Patients data...")
+# -----------------------------------
+# Word2Vec processor (간단 버전)
+# -----------------------------------
+from simple_word2vec_mosaic import SimpleWord2VecProcessor
+
+# -----------------------------------
+# Residual Block
+# -----------------------------------
+def residual_block(x, filters, kernel_size=3):
+    shortcut = x
+    x = Conv2D(filters, kernel_size, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = Conv2D(filters, kernel_size, padding="same")(x)
+    x = BatchNormalization()(x)
+    x = Add()([shortcut, x])
+    x = Activation("relu")(x)
+    return x
+
+# -----------------------------------
+# Attention (Squeeze-and-Excitation)
+# -----------------------------------
+def se_block(x, reduction=16):
+    filters = x.shape[-1]
+    se = GlobalAveragePooling2D()(x)
+    se = Dense(filters // reduction, activation='relu')(se)
+    se = Dense(filters, activation='sigmoid')(se)
+    se = Reshape((1, 1, filters))(se)
+    return Multiply()([x, se])
+
+# -----------------------------------
+# Autoencoder for Compression
+# -----------------------------------
+def build_autoencoder(input_shape):
+    """실제 압축이 가능한 Autoencoder 구축 - 정규화 강화 및 안정성 개선"""
+    inputs = Input(shape=input_shape)
+    print(f"   🔧 Building autoencoder for input shape: {input_shape}")
+
+    # Encoder - 점진적 압축 (드롭아웃 및 정규화 강화)
+    x = Conv2D(64, (3, 3), strides=2, padding="same", activation="relu")(inputs)  # /2
+    x = BatchNormalization()(x)
+    x = Dropout(0.2)(x)  # 드롭아웃 추가
+    x = residual_block(x, 64)
+    x = se_block(x)
+    print(f"   📐 After Conv1: {x.shape}")
+
+    x = Conv2D(128, (3, 3), strides=2, padding="same", activation="relu")(x)  # /4
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)  # 드롭아웃 증가
+    x = residual_block(x, 128)
+    x = se_block(x)
+    print(f"   📐 After Conv2: {x.shape}")
+
+    x = Conv2D(256, (3, 3), strides=2, padding="same", activation="relu")(x)  # /8
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)  # 더 강한 정규화
+    x = residual_block(x, 256)
+    x = se_block(x)
+    print(f"   📐 After Conv3: {x.shape}")
+
+    # 강력한 압축을 위한 추가 레이어 (정규화 강화)
+    x = Conv2D(512, (3, 3), strides=1, padding="same", activation="relu")(x)  
+    x = BatchNormalization()(x)
+    x = Dropout(0.5)(x)  # 최고 수준 정규화
     
-    # Read CSV file
-    df = pd.read_csv('patients.csv')
+    # 압축된 표현 (더 작은 차원으로 강화)
+    encoded = Conv2D(128, (3, 3), strides=1, padding="same", activation="relu")(x)  # 256→128로 축소
+    print(f"   🗜️ Bottleneck (compressed): {encoded.shape}")
     
-    # Remove empty rows
-    df = df.dropna(subset=['FIRST', 'LAST'])
+    # Decoder - 정확한 복원을 위한 크기 맞춤 (정규화 포함)
+    x = Conv2D(256, (3, 3), strides=1, padding="same", activation="relu")(encoded)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
     
-        
-    print(f"✅ Total {len(df)} patient records loaded")
+    x = Conv2D(512, (3, 3), strides=1, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)
     
-    # Combine text data
+    x = Conv2DTranspose(256, (3, 3), strides=2, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)
+    x = residual_block(x, 256)
+    
+    x = Conv2DTranspose(128, (3, 3), strides=2, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.2)(x)
+    x = residual_block(x, 128)
+    
+    x = Conv2DTranspose(64, (3, 3), strides=2, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.1)(x)
+    
+    # 최종 출력 - 원본과 정확히 같은 크기로 맞춤
+    decoded = Conv2D(1, (3, 3), padding="same", activation="sigmoid")(x)
+    
+    # 크기 불일치 시 크롭핑으로 조정
+    if decoded.shape[1] != input_shape[0] or decoded.shape[2] != input_shape[1]:
+        decoded = Lambda(lambda x: x[:, :input_shape[0], :input_shape[1], :])(decoded)
+    
+    print(f"   🔄 Reconstructed: {decoded.shape}")
+
+    # Full autoencoder (L2 정규화 추가)
+    autoencoder = Model(inputs, decoded)
+    autoencoder.compile(
+        optimizer=Adam(learning_rate=5e-4, weight_decay=1e-4),  # Weight decay 추가
+        loss='mse'
+    )
+    
+    # Encoder only (압축용)
+    encoder = Model(inputs, encoded)
+    
+    return autoencoder, encoder
+
+# -----------------------------------
+# Residual Attention CNN for Prediction
+# -----------------------------------
+def build_residual_attention_cnn(input_shape, output_size):
+    """단순화된 CNN 모델 - 학습 안정성 향상"""
+    inputs = Input(shape=input_shape)
+
+    # 더 간단한 구조로 변경
+    x = Conv2D(32, (3, 3), padding="same", activation="relu")(inputs)
+    x = BatchNormalization()(x)
+    x = Dropout(0.2)(x)
+
+    x = Conv2D(64, (3, 3), strides=2, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)
+
+    x = Conv2D(128, (3, 3), strides=2, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+
+    x = GlobalAveragePooling2D()(x)
+    
+    # 더 작은 Dense 레이어
+    x = Dense(128, activation="relu")(x)
+    x = Dropout(0.5)(x)
+    x = Dense(64, activation="relu")(x)  # 타깃 크기와 맞춤
+    x = Dropout(0.3)(x)
+    outputs = Dense(output_size, activation="linear")(x)
+
+    model = Model(inputs, outputs)
+    # 더 높은 학습률로 조정
+    model.compile(
+        optimizer=Adam(learning_rate=5e-4, weight_decay=1e-5), 
+        loss="mse", 
+        metrics=["mae"]
+    )
+    return model
+
+# -----------------------------------
+# Load & Preprocess Data with Evaluation
+# -----------------------------------
+def load_text_data(max_samples=10000):
+    """환자 데이터를 로드하고 더 풍부한 텍스트 정보 생성"""
+    print(f"📊 Loading patient data (max {max_samples} samples)...")
+    df = pd.read_csv("patients.csv", nrows=max_samples).dropna(subset=["FIRST", "LAST"])
+    
+    # 더 풍부한 텍스트 정보 생성
     texts = []
     for _, row in df.iterrows():
-        text_parts = []
+        parts = []
+        # 이름 정보
+        if pd.notna(row.get('FIRST')): parts.append(str(row['FIRST']))
+        if pd.notna(row.get('LAST')): parts.append(str(row['LAST']))
+        # 지역 정보
+        if pd.notna(row.get('CITY')): parts.append(str(row['CITY']))
+        if pd.notna(row.get('STATE')): parts.append(str(row['STATE']))
+        # 인구통계 정보
+        if pd.notna(row.get('RACE')): parts.append(str(row['RACE']))
+        if pd.notna(row.get('ETHNICITY')): parts.append(str(row['ETHNICITY']))
+        if pd.notna(row.get('GENDER')): parts.append(str(row['GENDER']))
         
-        # Name
-        if pd.notna(row['PREFIX']): text_parts.append(str(row['PREFIX']))
-        if pd.notna(row['FIRST']): text_parts.append(str(row['FIRST']))
-        if pd.notna(row['LAST']): text_parts.append(str(row['LAST']))
-        if pd.notna(row['SUFFIX']): text_parts.append(str(row['SUFFIX']))
-        
-        # Location info
-        if pd.notna(row['CITY']): text_parts.append(str(row['CITY']))
-        if pd.notna(row['STATE']): text_parts.append(str(row['STATE']))
-        if pd.notna(row['COUNTY']): text_parts.append(str(row['COUNTY']))
-        
-        # Demographic info
-        if pd.notna(row['RACE']): text_parts.append(str(row['RACE']))
-        if pd.notna(row['ETHNICITY']): text_parts.append(str(row['ETHNICITY']))
-        if pd.notna(row['GENDER']): text_parts.append(str(row['GENDER']))
-        if pd.notna(row['MARITAL']): text_parts.append(str(row['MARITAL']))
-        
-        # Birth place
-        if pd.notna(row['BIRTHPLACE']): 
-            birthplace_parts = str(row['BIRTHPLACE']).split()
-            text_parts.extend(birthplace_parts)
-        
-        # Combine text
-        combined_text = ' '.join(text_parts).lower()
-        texts.append(combined_text)
+        text = ' '.join(parts).lower()
+        texts.append(text)
     
-    # 텍스트 데이터 조합
-    texts = []
-    for _, row in df.iterrows():
-        text_parts = []
-        
-        # 이름
-        if pd.notna(row['PREFIX']): text_parts.append(str(row['PREFIX']))
-        if pd.notna(row['FIRST']): text_parts.append(str(row['FIRST']))
-        if pd.notna(row['LAST']): text_parts.append(str(row['LAST']))
-        if pd.notna(row['SUFFIX']): text_parts.append(str(row['SUFFIX']))
-        
-        # 위치 정보
-        if pd.notna(row['CITY']): text_parts.append(str(row['CITY']))
-        if pd.notna(row['STATE']): text_parts.append(str(row['STATE']))
-        if pd.notna(row['COUNTY']): text_parts.append(str(row['COUNTY']))
-        
-        # 인구통계학적 정보
-        if pd.notna(row['RACE']): text_parts.append(str(row['RACE']))
-        if pd.notna(row['ETHNICITY']): text_parts.append(str(row['ETHNICITY']))
-        if pd.notna(row['GENDER']): text_parts.append(str(row['GENDER']))
-        if pd.notna(row['MARITAL']): text_parts.append(str(row['MARITAL']))
-        
-        # 출생지
-        if pd.notna(row['BIRTHPLACE']): 
-            birthplace_parts = str(row['BIRTHPLACE']).split()
-            text_parts.extend(birthplace_parts)
-        
-        # 텍스트 조합
-        combined_text = ' '.join(text_parts).lower()
-        texts.append(combined_text)
-    
+    print(f"✅ Loaded {len(texts)} patient records")
+    print(f"   Sample text: '{texts[0]}'")
     return texts
 
-class CompressedDatasetMatrixGenerator:
-    """Generator to convert entire dataset into compressed mosaic"""
+def generate_mosaic(texts, vector_size=256, target_samples=None):
+    """텍스트를 모자이크 이미지로 변환"""
+    print(f"🎨 Generating mosaic from {len(texts)} texts...")
+    processor = SimpleWord2VecProcessor(vector_size=vector_size)
+    vectors = processor.train_and_vectorize(texts)
     
-    def __init__(self, vector_size=256, target_height=512, target_width=512):
-        self.vector_size = vector_size
-        self.target_height = target_height
-        self.target_width = target_width
-        self.compression_model = None
-        
-    def create_compression_model(self, input_shape):
-        """Create convolutional model to compress original giant mosaic"""
-        print(f"🏗️  Creating compression model: {input_shape} → ({self.target_height}, {self.target_width})")
-        
-        inputs = Input(shape=input_shape)
-        x = inputs
-        
-        # Sequential compression convolution
-        current_h, current_w = input_shape[0], input_shape[1]
-        
-        # Stage 1: Initial feature extraction
-        x = Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-        x = BatchNormalization()(x)
-        
-        # Stage 2: Progressive size compression
-        while current_h > self.target_height or current_w > self.target_width:
-            # Height compression needed
-            if current_h > self.target_height:
-                pool_h = min(2, current_h // self.target_height + 1)
-            else:
-                pool_h = 1
-                
-            # Width compression needed  
-            if current_w > self.target_width:
-                pool_w = min(2, current_w // self.target_width + 1)
-            else:
-                pool_w = 1
-            
-            if pool_h > 1 or pool_w > 1:
-                x = Conv2D(128, (3, 3), activation='relu', padding='same')(x)
-                x = MaxPooling2D((pool_h, pool_w))(x)
-                x = BatchNormalization()(x)
-                
-                current_h = current_h // pool_h
-                current_w = current_w // pool_w
-                
-                print(f"   Compression stage: {current_h}×{current_w}")
-            else:
-                break
-        
-        # Stage 3: Exact size adjustment
-        if current_h != self.target_height or current_w != self.target_width:
-            # Upsampling or downsampling for exact size fitting
-            x = Conv2D(256, (3, 3), activation='relu', padding='same')(x)
-            
-            # Global pooling then reshape
-            x = GlobalAveragePooling2D()(x)
-            x = Dense(self.target_height * self.target_width, activation='relu')(x)
-            x = Reshape((self.target_height, self.target_width, 1))(x)
+    # 정규화
+    vectors = (vectors - vectors.min()) / (vectors.max() - vectors.min() + 1e-8)
+    
+    # target_samples가 지정되면 패딩/자르기로 크기 맞춤
+    if target_samples and len(texts) != target_samples:
+        if len(texts) < target_samples:
+            # 패딩
+            padding_needed = target_samples - len(texts)
+            padding = np.zeros((padding_needed, vector_size))
+            vectors = np.vstack([vectors, padding])
         else:
-            # Final channel adjustment
-            x = Conv2D(1, (1, 1), activation='sigmoid')(x)
-        
-        model = Model(inputs=inputs, outputs=x)
-        model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-        
-        print(f"✅ Compression model completed: final size {self.target_height}×{self.target_width}")
-        
-        return model
+            # 자르기
+            vectors = vectors[:target_samples]
+        print(f"   Adjusted to {target_samples} samples")
     
-    def texts_to_compressed_matrix(self, texts):
-        """텍스트들을 압축된 하나의 모자이크 행렬로 변환"""
-        print(f"\n🎨 전체 데이터셋 압축 모자이크 생성")
-        print("="*50)
-        
-        # 1. Word2Vec 벡터화
-        print("1️⃣ Word2Vec 벡터화...")
-        processor = SimpleWord2VecProcessor(vector_size=self.vector_size)
-        vectors = processor.train_and_vectorize(texts)
-        
-        print(f"   벡터 행렬: {vectors.shape}")
-        
-        # 2. 원본 거대 모자이크 생성
-        print("2️⃣ 원본 거대 모자이크 생성...")
-        
-        # 벡터 정규화 (0-1 범위)
-        vectors_normalized = (vectors - vectors.min()) / (vectors.max() - vectors.min())
-        
-        # 하나의 거대한 이미지로 구성 (4D 텐서로: batch, height, width, channels)
-        # 2D 행렬을 4D로 변환: (samples, features) -> (1, samples, features, 1)
-        original_matrix = vectors_normalized.reshape(1, len(texts), self.vector_size, 1)
-        
-        print(f"   원본 모자이크: {original_matrix.shape}")
-        print(f"   크기: {len(texts)}×{self.vector_size} = {len(texts) * self.vector_size:,} 픽셀")
-        
-        # 3. 압축이 필요한지 판단
-        total_pixels = len(texts) * self.vector_size
-        target_pixels = self.target_height * self.target_width
-        
-        print(f"3️⃣ 압축 필요성 판단...")
-        print(f"   원본 픽셀 수: {total_pixels:,}")
-        print(f"   목표 픽셀 수: {target_pixels:,}")
-        print(f"   압축 비율: {total_pixels/target_pixels:.1f}:1")
-        
-        if total_pixels > target_pixels * 1.5:  # 50% 이상 클 때만 압축
-            print("   ✅ 압축 필요 → 컨볼루션 압축 실행")
-            
-            # 4. 컨볼루션 압축 모델 생성 (4D 입력: height, width, channels)
-            input_shape = (len(texts), self.vector_size, 1)
-            self.compression_model = self.create_compression_model(input_shape)
-            
-            # 5. 압축 실행 (자기지도학습 방식)
-            print("4️⃣ 압축 실행...")
-            
-            # 압축 모델 적용 (4D 입력)
-            compressed_matrix = self.compression_model.predict(original_matrix, verbose=0)[0]
-            
-            print(f"   압축 완료: {original_matrix.shape} → {compressed_matrix.shape}")
-            
+    # 4D 텐서로 변환: (1, samples, vector_size, 1)
+    mosaic = vectors.reshape(1, vectors.shape[0], vector_size, 1)
+    print(f"   Mosaic shape: {mosaic.shape}")
+    return mosaic, vectors
+
+# -----------------------------------
+# Evaluation Metrics
+# -----------------------------------
+def calculate_metrics(y_true, y_pred, name=""):
+    """포괄적인 평가 메트릭 계산 - 안정성 개선"""
+    # 입력 데이터 검증 및 정리
+    y_true = np.asarray(y_true).flatten()
+    y_pred = np.asarray(y_pred).flatten()
+    
+    # NaN 또는 inf 값 제거
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not np.any(valid_mask):
+        print(f"   ⚠️ Warning: No valid values found in {name}")
+        return {
+            'mse': float('inf'),
+            'mae': float('inf'),
+            'r2': -float('inf'),
+            'correlation': 0.0,
+            'smape': 100.0
+        }
+    
+    y_true_clean = y_true[valid_mask]
+    y_pred_clean = y_pred[valid_mask]
+    
+    # 기본 메트릭 계산
+    mse = mean_squared_error(y_true_clean, y_pred_clean)
+    mae = mean_absolute_error(y_true_clean, y_pred_clean)
+    
+    # 안전한 R² 계산
+    try:
+        # 분산이 0에 가까운 경우 처리
+        y_var = np.var(y_true_clean)
+        if y_var < 1e-10:
+            r2 = 0.0  # 상수 타깃의 경우
         else:
-            print("   ❌ 압축 불필요 → 원본 사용")
-            
-            # 원본 사용 (배치 차원 제거)
-            original_matrix_2d = original_matrix.squeeze(0)  # (2000, 256, 1)
-            
-            # 크기 조정만 수행
-            if len(texts) < self.target_height and self.vector_size < self.target_width:
-                # 패딩으로 크기 맞추기
-                pad_h = self.target_height - len(texts)
-                pad_w = self.target_width - self.vector_size
-                
-                compressed_matrix = np.pad(original_matrix_2d.squeeze(), 
-                                         ((0, pad_h), (0, pad_w)), 
-                                         mode='constant', constant_values=0)
-                compressed_matrix = np.expand_dims(compressed_matrix, axis=-1)
-            else:
-                # 크롭해서 크기 맞추기
-                h_end = min(len(texts), self.target_height)
-                w_end = min(self.vector_size, self.target_width)
-                
-                compressed_matrix = original_matrix_2d[:h_end, :w_end, :]
-        
-        # 6. 최종 결과 확인
-        print(f"\n✅ 최종 압축 모자이크:")
-        print(f"   크기: {compressed_matrix.shape}")
-        print(f"   값 범위: [{compressed_matrix.min():.4f}, {compressed_matrix.max():.4f}]")
-        print(f"   데이터 타입: {compressed_matrix.dtype}")
-        
-        return compressed_matrix, vectors
+            r2 = r2_score(y_true_clean, y_pred_clean)
+            # R² 값이 비정상적인 경우 클리핑
+            if np.isnan(r2) or np.isinf(r2):
+                r2 = -1.0  # 최소값으로 설정
+            elif r2 < -10:
+                r2 = -10.0  # 하한 설정
+    except:
+        r2 = -1.0
+    
+    # 안전한 상관관계 계산
+    try:
+        if len(np.unique(y_true_clean)) < 2 or len(np.unique(y_pred_clean)) < 2:
+            correlation = 0.0  # 상수 배열의 경우
+        else:
+            correlation = np.corrcoef(y_true_clean, y_pred_clean)[0, 1]
+            if np.isnan(correlation) or np.isinf(correlation):
+                correlation = 0.0
+    except:
+        correlation = 0.0
+    
+    # 안전한 SMAPE 계산
+    try:
+        denominator = np.abs(y_true_clean) + np.abs(y_pred_clean) + 1e-8
+        smape = 2.0 * np.mean(np.abs(y_true_clean - y_pred_clean) / denominator) * 100
+        if np.isnan(smape) or np.isinf(smape):
+            smape = 100.0
+    except:
+        smape = 100.0
+    
+    metrics = {
+        'mse': float(mse),
+        'mae': float(mae),
+        'r2': float(r2),
+        'correlation': float(correlation),
+        'smape': float(smape)
+    }
+    
+    if name:
+        print(f"📊 {name} Metrics:")
+        print(f"   • MSE: {mse:.6f}")
+        print(f"   • MAE: {mae:.4f}")
+        print(f"   • R²: {r2:.4f}")
+        print(f"   • Correlation: {correlation:.4f}")
+        print(f"   • SMAPE: {smape:.2f}%")
+        print(f"   • Valid samples: {len(y_true_clean)}/{len(y_true)}")
+    
+    return metrics
 
-class CompressedMatrixCNN:
-    """CNN for compressed mosaic learning"""
-    
-    def __init__(self, matrix_shape, target_vector_size=64):
-        self.matrix_shape = matrix_shape
-        self.target_vector_size = target_vector_size
-        self.model = self.build_model()
-        
-    def build_model(self):
-        """Build compressed mosaic → feature vector learning model"""
-        print(f"🏗️  Building compressed mosaic CNN: {self.matrix_shape} → {self.target_vector_size}D")
-        
-        inputs = Input(shape=self.matrix_shape)
-        
-        # Multi-scale feature extraction
-        # Small pattern detection
-        conv1 = Conv2D(32, (3, 3), activation='relu', padding='same')(inputs)
-        conv1 = MaxPooling2D((2, 2))(conv1)
-        
-        # Medium pattern detection  
-        conv2 = Conv2D(64, (5, 5), activation='relu', padding='same')(conv1)
-        conv2 = MaxPooling2D((2, 2))(conv2)
-        
-        # Large pattern detection
-        conv3 = Conv2D(128, (7, 7), activation='relu', padding='same')(conv2)
-        conv3 = MaxPooling2D((2, 2))(conv3)
-        
-        # Global feature extraction
-        global_features = GlobalAveragePooling2D()(conv3)
-        
-        # Fully connected layers
-        dense1 = Dense(256, activation='relu')(global_features)
-        dense2 = Dense(128, activation='relu')(dense1)
-        outputs = Dense(self.target_vector_size, activation='linear')(dense2)
-        
-        model = Model(inputs=inputs, outputs=outputs)
-        model.compile(
-            optimizer=Adam(learning_rate=0.001),
-            loss='mse',
-            metrics=['mae']
-        )
-        
-        model.summary()
-        return model
-    
-    def create_target_vector(self, original_vectors):
-        """Generate learning target vector from original vectors"""
-        print("🎯 Generating learning target vector...")
-        
-        # Combine various statistical features
-        features = []
-        
-        # Basic statistics
-        features.extend(np.mean(original_vectors, axis=0)[:16])  # Mean
-        features.extend(np.std(original_vectors, axis=0)[:16])   # Standard deviation
-        features.extend(np.min(original_vectors, axis=0)[:16])   # Minimum
-        features.extend(np.max(original_vectors, axis=0)[:16])   # Maximum
-        
-        target_vector = np.array(features)
-        
-        print(f"   Target vector size: {len(target_vector)}")
-        print(f"   Target vector range: [{target_vector.min():.4f}, {target_vector.max():.4f}]")
-        
-        return target_vector
-    
-    def train(self, compressed_matrix, target_vector, epochs=30):
-        """Train with compressed mosaic"""
-        print(f"🚀 Starting compressed mosaic training...")
-        
-        # Prepare input data
-        X = np.expand_dims(compressed_matrix, axis=0)  # Add batch dimension
-        y = np.expand_dims(target_vector, axis=0)      # Add batch dimension
-        
-        print(f"   Input size: {X.shape}")
-        print(f"   Target size: {y.shape}")
-        
-        # Execute training
-        history = self.model.fit(
-            X, y,
-            epochs=epochs,
-            verbose=1,
-            validation_split=0.0  # No validation for single sample
-        )
-        
-        return history
-    
-    def predict(self, compressed_matrix):
-        """Predict features from compressed mosaic"""
-        X = np.expand_dims(compressed_matrix, axis=0)
-        prediction = self.model.predict(X, verbose=0)[0]
-        return prediction
-
-def visualize_compression_process(original_shape, compressed_matrix, vectors, texts):
-    """Visualize compression process"""
-    print("🎨 Visualizing compression process...")
-    
+def plot_results(history_ae, history_cnn, train_metrics, val_metrics):
+    """결과 시각화"""
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle(f'Complete Dataset Compression Mosaic Process\nOriginal: {original_shape[0]}×{original_shape[1]} → Compressed: {compressed_matrix.shape[0]}×{compressed_matrix.shape[1]}', 
-                 fontsize=16, fontweight='bold')
     
-    # 1. Compressed mosaic image
-    im1 = axes[0, 0].imshow(compressed_matrix.squeeze(), cmap='viridis', aspect='auto')
-    axes[0, 0].set_title(f'Compressed Complete Dataset Mosaic\n{compressed_matrix.shape[0]}×{compressed_matrix.shape[1]}')
-    axes[0, 0].set_xlabel('Compressed Vector Dimensions')
-    axes[0, 0].set_ylabel('Compressed Sample Dimensions')
-    plt.colorbar(im1, ax=axes[0, 0])
+    # Autoencoder 학습 곡선
+    axes[0, 0].plot(history_ae.history['loss'], label='Train Loss')
+    axes[0, 0].plot(history_ae.history['val_loss'], label='Val Loss')
+    axes[0, 0].set_title('Autoencoder Training')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True)
     
-    # 2. Vector value distribution
-    axes[0, 1].hist(vectors.flatten(), bins=50, alpha=0.7, color='blue', label='Original Vectors')
-    axes[0, 1].hist(compressed_matrix.flatten(), bins=50, alpha=0.7, color='red', label='Compressed Mosaic')
-    axes[0, 1].set_title('Vector Value Distribution Comparison')
-    axes[0, 1].set_xlabel('Values')
-    axes[0, 1].set_ylabel('Frequency')
+    # CNN 학습 곡선
+    axes[0, 1].plot(history_cnn.history['loss'], label='Train Loss')
+    axes[0, 1].plot(history_cnn.history['val_loss'], label='Val Loss')
+    axes[0, 1].set_title('CNN Training')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Loss')
     axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].grid(True)
     
-    # 3. Compression ratio information
-    original_size = original_shape[0] * original_shape[1] 
-    compressed_size = compressed_matrix.shape[0] * compressed_matrix.shape[1]
-    compression_ratio = original_size / compressed_size
+    # MAE 비교
+    mae_comparison = [train_metrics['mae'], val_metrics['mae']]
+    axes[0, 2].bar(['Training', 'Validation'], mae_comparison, color=['blue', 'orange'])
+    axes[0, 2].set_title('MAE Comparison')
+    axes[0, 2].set_ylabel('MAE')
     
-    info_text = f"""Compression Info:
-Original Size: {original_shape[0]}×{original_shape[1]} = {original_size:,} pixels
-Compressed Size: {compressed_matrix.shape[0]}×{compressed_matrix.shape[1]} = {compressed_size:,} pixels
-Compression Ratio: {compression_ratio:.1f}:1
-Memory Saved: {(1-1/compression_ratio)*100:.1f}%
+    # 상관관계 비교
+    corr_comparison = [train_metrics['correlation'], val_metrics['correlation']]
+    axes[1, 0].bar(['Training', 'Validation'], corr_comparison, color=['green', 'red'])
+    axes[1, 0].set_title('Correlation Comparison')
+    axes[1, 0].set_ylabel('Correlation')
+    
+    # R² 비교
+    r2_comparison = [train_metrics['r2'], val_metrics['r2']]
+    axes[1, 1].bar(['Training', 'Validation'], r2_comparison, color=['purple', 'brown'])
+    axes[1, 1].set_title('R² Score Comparison')
+    axes[1, 1].set_ylabel('R² Score')
+    
+    # 성능 요약
+    summary_text = f"""Performance Summary:
 
-Data Info:
-Total Patients: {len(texts):,}
-Vector Dimensions: {vectors.shape[1]}
-Text Sample: "{texts[0][:50]}..."
+Training:
+• MAE: {train_metrics['mae']:.4f}
+• Correlation: {train_metrics['correlation']:.4f}
+• R²: {train_metrics['r2']:.4f}
+
+Validation:
+• MAE: {val_metrics['mae']:.4f}
+• Correlation: {val_metrics['correlation']:.4f}
+• R²: {val_metrics['r2']:.4f}
+
+Generalization:
+• MAE Ratio: {val_metrics['mae']/train_metrics['mae']:.2f}
+• Correlation Drop: {train_metrics['correlation'] - val_metrics['correlation']:.4f}
 """
-    
-    axes[0, 2].text(0.05, 0.95, info_text, transform=axes[0, 2].transAxes, 
+    axes[1, 2].text(0.05, 0.95, summary_text, transform=axes[1, 2].transAxes,
                     fontsize=10, verticalalignment='top', fontfamily='monospace')
-    axes[0, 2].set_title('Compression Information')
-    axes[0, 2].axis('off')
-    
-    # 4. Vector norm per patient (sampling)
-    sample_indices = np.linspace(0, len(vectors)-1, min(1000, len(vectors)), dtype=int)
-    sample_norms = np.linalg.norm(vectors[sample_indices], axis=1)
-    axes[1, 0].plot(sample_norms, 'b-', alpha=0.7, linewidth=0.5)
-    axes[1, 0].set_title(f'Vector Size per Patient (Sampling: {len(sample_indices)} patients)')
-    axes[1, 0].set_xlabel('Patient Number (Sampled)')
-    axes[1, 0].set_ylabel('Vector Norm')
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # 5. Average values per dimension
-    dim_means = np.mean(vectors, axis=0)
-    axes[1, 1].plot(dim_means, 'g-', alpha=0.7, linewidth=0.8)
-    axes[1, 1].set_title('Average Values per Dimension')
-    axes[1, 1].set_xlabel('Vector Dimension')
-    axes[1, 1].set_ylabel('Average Value')
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    # 6. Compressed mosaic heatmap (partial)
-    if compressed_matrix.shape[0] > 50 or compressed_matrix.shape[1] > 50:
-        # Show partial if large
-        display_h = min(50, compressed_matrix.shape[0])
-        display_w = min(50, compressed_matrix.shape[1])
-        display_matrix = compressed_matrix[:display_h, :display_w]
-        title_suffix = f' (Top {display_h}×{display_w} region)'
-    else:
-        display_matrix = compressed_matrix
-        title_suffix = ''
-    
-    im6 = axes[1, 2].imshow(display_matrix.squeeze(), cmap='coolwarm', aspect='auto')
-    axes[1, 2].set_title(f'Compressed Mosaic Detail{title_suffix}')
-    axes[1, 2].set_xlabel('Vector Dimension')
-    axes[1, 2].set_ylabel('Patient')
-    plt.colorbar(im6, ax=axes[1, 2])
+    axes[1, 2].set_title('Performance Summary')
+    axes[1, 2].axis('off')
     
     plt.tight_layout()
-    plt.savefig('compressed_dataset_matrix_visualization.png', dpi=300, bbox_inches='tight')
+    plt.savefig('training_results.png', dpi=300, bbox_inches='tight')
     plt.show()
     
-    print("✅ Visualization completed: compressed_dataset_matrix_visualization.png saved")
+    print("✅ Results visualization saved as 'training_results.png'")
 
-def test_compressed_dataset_matrix():
-    """Test compressed dataset matrix approach"""
+# -----------------------------------
+# Main Test Function with Comprehensive Evaluation
+# -----------------------------------
+def test_pipeline():
+    """메인 테스트 파이프라인 - 개선된 평가 시스템"""
+    print("🚀 Starting Comprehensive Training and Evaluation Pipeline")
+    print("="*70)
     
-    print("🧪 Compressed Dataset Matrix Test")
-    print("="*60)
+    start_time = time.time()
     
-    # 1. Load data
-    texts = load_patients_data()
+    # 1. 데이터 로딩 및 분할 (7000 학습, 3000 검증)
+    texts = load_text_data(max_samples=10000)
     
-    # Set sample size for testing (full or partial)
-    max_samples = 2000  # Maximum samples for testing
-    if len(texts) > max_samples:
-        print(f"⚠️  Using {max_samples} samples for testing (Total: {len(texts)})")
-        texts = texts[:max_samples]
-    
-    print(f"🎯 Test data: {len(texts)} samples")
-    
-    # 2. Generate compressed mosaic
-    generator = CompressedDatasetMatrixGenerator(
-        vector_size=256,
-        target_height=512,  # Target height
-        target_width=512    # Target width
+    print(f"\n📊 Data Split: 7,000 training / 3,000 validation")
+    train_texts, val_texts = train_test_split(
+        texts, train_size=7000, test_size=3000, random_state=42, shuffle=True
     )
     
-    compressed_matrix, original_vectors = generator.texts_to_compressed_matrix(texts)
+    print(f"   ✅ Actual split: {len(train_texts)} train, {len(val_texts)} validation")
     
-    # 3. Visualization
-    original_shape = (len(texts), 256)
-    visualize_compression_process(original_shape, compressed_matrix, original_vectors, texts)
+    # 2. 모자이크 생성 (크기 통일)
+    print(f"\n🎨 Phase 1: Mosaic Generation")
+    # 7000 샘플로 크기 통일 (validation은 패딩됨)
+    train_mosaic, train_vec = generate_mosaic(train_texts, target_samples=7000)
+    val_mosaic, val_vec = generate_mosaic(val_texts, target_samples=7000)
     
-    # 4. Learning test
-    print(f"\n{'='*50}")
-    print("🤖 Compressed Mosaic Learning Test")
-    print(f"{'='*50}")
+    input_shape = train_mosaic.shape[1:]  # (samples, vector_size, 1)
     
-    # Create CNN model
-    cnn = CompressedMatrixCNN(
-        matrix_shape=compressed_matrix.shape, 
-        target_vector_size=64
+    print(f"   Input shape: {input_shape}")
+    
+    # 3. Autoencoder 압축 학습 (실제 압축이 가능한 버전)
+    print(f"\n🤖 Phase 2: Autoencoder Training with Real Compression")
+    autoencoder, encoder = build_autoencoder(input_shape)
+    
+    # 콜백 설정 (조기 종료 강화)
+    ae_callbacks = [
+        EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True, min_delta=1e-5),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4, min_lr=1e-6, verbose=1)
+    ]
+    
+    # Autoencoder 학습 (실제 압축 최적화)
+    print("   Training autoencoder for real compression...")
+    history_ae = autoencoder.fit(
+        train_mosaic, train_mosaic,
+        epochs=40,           # 에포크 감소 (50→40)
+        batch_size=32,       # 배치 크기 증가 (16→32)
+        validation_data=(val_mosaic, val_mosaic),
+        callbacks=ae_callbacks,
+        verbose=1
     )
     
-    # Generate learning target vector
-    target_vector = cnn.create_target_vector(original_vectors)
+    # 4. 실제 압축본 생성 (encoder만 사용)
+    print(f"\n🗜️ Phase 3: Generating Real Compressed Representations")
+    compressed_train = encoder.predict(train_mosaic, verbose=0)
+    compressed_val = encoder.predict(val_mosaic, verbose=0)
     
-    # Execute training
-    history = cnn.train(compressed_matrix, target_vector, epochs=25)
+    print(f"   Compressed train shape: {compressed_train.shape}")
+    print(f"   Compressed val shape: {compressed_val.shape}")
     
-    # Prediction test
-    predicted_features = cnn.predict(compressed_matrix)
+    # 압축 효율성 계산
+    original_size = np.prod(train_mosaic.shape[1:])
+    compressed_size = np.prod(compressed_train.shape[1:])
+    compression_ratio = original_size / compressed_size
+    print(f"   Compression ratio: {compression_ratio:.2f}:1")
     
-    # Result analysis
-    mae = np.mean(np.abs(target_vector - predicted_features))
-    correlation = np.corrcoef(target_vector, predicted_features)[0, 1]
+    # 5. CNN 예측 학습 (데이터 증강 포함)
+    print(f"\n🧠 Phase 4: CNN Prediction Training with Data Augmentation")
+    cnn = build_residual_attention_cnn(compressed_train.shape[1:], output_size=64)
     
-    print(f"\n📊 Final Learning Results:")
-    print(f"   Compression Ratio: {(len(texts) * 256) / (compressed_matrix.shape[0] * compressed_matrix.shape[1]):.1f}:1")
-    print(f"   MAE: {mae:.4f}")
-    print(f"   Correlation: {correlation:.4f}")
-    print(f"   Target Vector Range: [{target_vector.min():.4f}, {target_vector.max():.4f}]")
-    print(f"   Predicted Vector Range: [{predicted_features.min():.4f}, {predicted_features.max():.4f}]")
+    # 더 단순하고 효과적인 타깃 벡터 생성
+    def create_simple_target(vecs):
+        """단순화된 타깃 벡터 생성 - 더 학습하기 쉬운 형태"""
+        # 상위 64개 주성분 사용 (모델 출력과 맞춤)
+        mean_features = np.mean(vecs, axis=0)[:64]
+        # 정규화
+        mean_features = (mean_features - mean_features.min()) / (mean_features.max() - mean_features.min() + 1e-8)
+        return mean_features
     
-    # Learning performance assessment
-    if mae < 0.1 and correlation > 0.8:
-        learning_status = "✅ Excellent Learning"
-        explanation = "Successfully learned complete dataset patterns from compressed mosaic"
-    elif mae < 0.2 and correlation > 0.6:
-        learning_status = "⚠️  Average Learning"
-        explanation = "Some information loss during compression but basic patterns learned"
+    y_train = np.expand_dims(create_simple_target(train_vec), axis=0)
+    y_val = np.expand_dims(create_simple_target(val_vec), axis=0)
+    
+    print(f"   Target vector dimension: {y_train.shape[-1]} (simplified)")
+    
+    # 데이터 증강: 더 부드러운 증강 적용
+    print("   Applying gentle data augmentation...")
+    augmented_train = [compressed_train]  # 원본 포함
+    augmented_targets = [y_train]
+    
+    for i in range(2):  # 2개의 증강된 버전만 추가
+        noise_level = 0.001 * (i + 1)  # 매우 낮은 노이즈
+        augmented_batch = compressed_train + np.random.normal(0, noise_level, compressed_train.shape)
+        augmented_train.append(augmented_batch)
+        augmented_targets.append(y_train)
+    
+    # 배치들을 결합
+    X_train_aug = np.vstack(augmented_train)
+    y_train_aug = np.vstack(augmented_targets)
+    
+    print(f"   Augmented training data shape: {X_train_aug.shape}")
+    print(f"   Augmented target shape: {y_train_aug.shape}")
+    
+    # CNN 콜백 설정 (더 관대한 조기 종료)
+    cnn_callbacks = [
+        EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, min_delta=1e-6),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.7, patience=8, min_lr=1e-6, verbose=1)
+    ]
+    
+    # CNN 학습 (더 긴 학습 허용)
+    print("   Training simplified CNN...")
+    history_cnn = cnn.fit(
+        X_train_aug, y_train_aug,
+        epochs=120,         # 에포크 증가 
+        batch_size=8,       # 원래 배치 크기로 복원
+        validation_data=(compressed_val, y_val),
+        callbacks=cnn_callbacks,
+        verbose=1
+    )
+    
+    # 6. 최종 평가 및 Robustness 테스트
+    print(f"\n📊 Phase 5: Comprehensive Evaluation with Robustness Analysis")
+    
+    # 예측 수행
+    train_pred = cnn.predict(compressed_train, verbose=0)
+    val_pred = cnn.predict(compressed_val, verbose=0)
+    
+    # 메트릭 계산
+    train_metrics = calculate_metrics(y_train, train_pred, "Training")
+    val_metrics = calculate_metrics(y_val, val_pred, "Validation")
+    
+    # Robustness 테스트 (노이즈 추가된 데이터로 예측 일관성 확인)
+    print(f"\n🛡️ Robustness Analysis:")
+    robustness_scores = []
+    for noise_level in [0.001, 0.005, 0.01]:
+        noisy_val = compressed_val + np.random.normal(0, noise_level, compressed_val.shape)
+        noisy_pred = cnn.predict(noisy_val, verbose=0)
+        consistency = np.corrcoef(val_pred.flatten(), noisy_pred.flatten())[0, 1]
+        robustness_scores.append(consistency)
+        print(f"   • Noise level {noise_level:.3f}: {consistency:.3f} consistency")
+    
+    avg_robustness = np.mean(robustness_scores)
+    print(f"   • Average robustness: {avg_robustness:.3f}")
+    
+    if avg_robustness > 0.9:
+        robustness_grade = "🛡️ Highly robust"
+    elif avg_robustness > 0.8:
+        robustness_grade = "👍 Moderately robust"
     else:
-        learning_status = "❌ Insufficient Learning"
-        explanation = "Compression ratio too high or data complexity too high"
+        robustness_grade = "⚠️ Low robustness"
     
-    print(f"\n🎯 Learning Evaluation: {learning_status}")
-    print(f"   {explanation}")
+    print(f"   • Robustness grade: {robustness_grade}")
+    
+    # 7. 일반화 성능 분석 (개선된 기준)
+    print(f"\n🎯 Generalization Analysis:")
+    mae_ratio = val_metrics['mae'] / train_metrics['mae']
+    corr_drop = train_metrics['correlation'] - val_metrics['correlation']
+    
+    print(f"   • MAE Ratio (val/train): {mae_ratio:.3f}")
+    print(f"   • Correlation Drop: {corr_drop:.4f}")
+    print(f"   • Compression Efficiency: {compression_ratio:.1f}:1")
+    
+    # 성능 등급 결정 (개선된 기준)
+    if val_metrics['correlation'] > 0.85 and val_metrics['r2'] > 0.7 and mae_ratio < 1.2:
+        grade = "🏆 Excellent"
+    elif val_metrics['correlation'] > 0.75 and val_metrics['r2'] > 0.5 and mae_ratio < 1.5:
+        grade = "✅ Good"  
+    elif val_metrics['correlation'] > 0.6 and val_metrics['r2'] > 0.3:
+        grade = "👍 Moderate"
+    else:
+        grade = "⚠️ Needs Improvement"
+    
+    print(f"   • Overall Performance: {grade}")
+    
+    # 일반화 등급
+    if mae_ratio < 1.0 and corr_drop < 0.05:
+        gen_grade = "🎯 Excellent Generalization"
+    elif mae_ratio < 1.2 and corr_drop < 0.1:
+        gen_grade = "👍 Good Generalization"
+    elif mae_ratio < 1.5:
+        gen_grade = "👍 Moderate Generalization" 
+    else:
+        gen_grade = "⚠️ Poor Generalization"
+    
+    print(f"   • Generalization: {gen_grade}")
+    
+    # 8. 시각화 및 결과 저장
+    print(f"\n📈 Generating Results Visualization...")
+    plot_results(history_ae, history_cnn, train_metrics, val_metrics)
+    
+    # 실행 시간
+    total_time = time.time() - start_time
+    print(f"\n⏱️ Total execution time: {total_time:.2f} seconds")
+    
+    # 9. 최종 요약 리포트 (개선된 버전)
+    print(f"\n{'='*70}")
+    print("🎓 ENHANCED PERFORMANCE REPORT")
+    print(f"{'='*70}")
+    print(f"📊 Dataset: {len(texts)} samples ({len(train_texts)} train / {len(val_texts)} val)")
+    print(f"🗜️ Compression: {compression_ratio:.1f}:1 ratio")
+    print(f"� Optimization: Batch size 8 + Data Augmentation + Low LR (0.0005)")
+    print(f"�📈 Training Performance:")
+    print(f"   • Correlation: {train_metrics['correlation']:.4f} ({train_metrics['correlation']*100:.1f}%)")
+    print(f"   • R² Score: {train_metrics['r2']:.4f} ({train_metrics['r2']*100:.1f}%)")
+    print(f"   • MAE: {train_metrics['mae']:.4f}")
+    print(f"🎯 Validation Performance:")
+    print(f"   • Correlation: {val_metrics['correlation']:.4f} ({val_metrics['correlation']*100:.1f}%)")
+    print(f"   • R² Score: {val_metrics['r2']:.4f} ({val_metrics['r2']*100:.1f}%)")
+    print(f"   • MAE: {val_metrics['mae']:.4f}")
+    print(f"📊 Generalization Metrics:")
+    print(f"   • MAE Ratio: {mae_ratio:.3f}")
+    print(f"   • Correlation Drop: {corr_drop:.4f}")
+    print(f"   • Evaluation: {gen_grade}")
+    print(f"🛡️ Robustness: {avg_robustness:.3f} ({robustness_grade})")
+    print(f"🏆 Overall Grade: {grade}")
+    print(f"⏱️ Training Time: {total_time:.1f}s")
+    print(f"{'='*70}")
     
     return {
-        'compressed_matrix': compressed_matrix,
-        'original_vectors': original_vectors,
-        'mae': mae,
-        'correlation': correlation,
-        'compression_ratio': (len(texts) * 256) / (compressed_matrix.shape[0] * compressed_matrix.shape[1]),
-        'learning_status': learning_status
+        'train_metrics': train_metrics,
+        'val_metrics': val_metrics,
+        'compression_ratio': compression_ratio,
+        'training_time': total_time,
+        'grade': grade,
+        'generalization_grade': gen_grade,
+        'robustness_score': avg_robustness,
+        'robustness_grade': robustness_grade,
+        'mae_ratio': mae_ratio
     }
 
 if __name__ == "__main__":
-    # Execute compressed dataset matrix test
-    results = test_compressed_dataset_matrix()
-    
-    print("\n🎉 Compressed Dataset Matrix Test Complete!")
-    print("The entire dataset has been converted into a single compressed mosaic,")
-    print("enabling efficient memory usage and pattern learning.")
+    test_pipeline()

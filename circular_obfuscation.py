@@ -7,21 +7,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # BERT 관련 import (필요시 주석 해제)
-# from transformers import BertTokenizer, BertForSequenceClassification
+from transformers import BertForSequenceClassification
 
 class CircularObfuscationModel(nn.Module):
     """
     텍스트→이미지→벡터→이미지→텍스트 순환 구조 모델
     공격자가 중간 데이터를 탈취하더라도 의미 추론이 어려움
     """
-    def __init__(self, num_classes=2, vocab_size=30522):
+    def __init__(self, num_classes=2, vocab_size=30522, use_bert=True):
         super().__init__()
+
+        self.use_bert = use_bert
 
         # ===== Phase 1: Text → Image 변환 =====
         # 1. Text Encoder (기존 BERT)
-        # self.text_encoder = BertForSequenceClassification.from_pretrained(
-        #     'bert-base-uncased', num_labels=num_classes
-        # )
+        if use_bert:
+            self.text_encoder = BertForSequenceClassification.from_pretrained(
+                'bert-base-uncased', num_labels=num_classes
+            )
+        # BERT를 사용하지 않을 때는 랜덤 임베딩 생성용 레이어 추가
+        else:
+            self.text_embedding_layer = nn.Linear(768, 768)
 
         # 2. Image Generator (Text → Image)
         self.image_generator = nn.Sequential(
@@ -75,20 +81,33 @@ class CircularObfuscationModel(nn.Module):
         # 드롭아웃으로 과적합 방지
         self.dropout = nn.Dropout(0.1)
 
-    def forward(self, input_ids, attention_mask, labels=None, return_all=False):
+    def forward(self, input_ids, attention_mask=None, labels=None, return_all=False):
         """
         순환 변환 수행
         Args:
-            input_ids: BERT 토큰 ID들
-            attention_mask: 어텐션 마스크
+            input_ids: BERT 토큰 ID들 또는 smashed_vector (서버 모드)
+            attention_mask: 어텐션 마스크 (클라이언트 모드에서만 사용)
             labels: 분류 레이블 (선택)
             return_all: 모든 중간 결과 반환 여부
         """
         # ===== Phase 1: Text → Image =====
-        # 1. Text encoding (BERT 임베딩 시뮬레이션)
-        # 실제로는 BERT를 사용하지만 여기서는 간단히 랜덤 임베딩 사용
-        batch_size = input_ids.size(0)
-        text_embedding = torch.randn(batch_size, 768).to(input_ids.device)  # CLS token
+        if self.use_bert and attention_mask is not None:
+            # 클라이언트 모드: BERT 사용
+            outputs = self.text_encoder(
+                input_ids=input_ids, attention_mask=attention_mask,
+                output_hidden_states=True
+            )
+            text_embedding = outputs.hidden_states[-1][:, 0, :]  # CLS token
+        else:
+            # 서버 모드: 랜덤 임베딩 (smashed_vector를 입력으로 받음)
+            if attention_mask is None:
+                # 서버 모드: input_ids는 smashed_vector
+                text_embedding = input_ids
+            else:
+                # 클라이언트 모드지만 BERT 미사용
+                batch_size = input_ids.size(0)
+                text_embedding = torch.randn(batch_size, 768).to(input_ids.device)
+                text_embedding = self.text_embedding_layer(text_embedding)
 
         # 2. Generate image from text
         generated_image = self.image_generator(text_embedding)
@@ -221,6 +240,20 @@ class ServerCircularModel(nn.Module):
             loss = F.cross_entropy(classification_logits, labels)
             return classification_logits, loss, text_logits
         return classification_logits, text_logits
+
+# 사용 예시:
+"""
+# 1. 모델 초기화
+model = CircularObfuscationModel(num_classes=2)
+
+# 2. 순환 변환 수행
+outputs = model(input_ids, attention_mask, labels, return_all=True)
+
+# 3. 결과 확인
+print(f"Generated Image Shape: {outputs['generated_image'].shape}")
+print(f"Smashed Vector Shape: {outputs['smashed_vector'].shape}")
+print(f"Classification Accuracy: {outputs['classification_logits'].argmax(dim=1) == labels}")
+"""
 
 # 사용 예시:
 """

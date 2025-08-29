@@ -9,45 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
-from circular_obfuscation import ClientCircularModel
-
-class ClientCircularModel(nn.Module):
-    """
-    클라이언트 측: Text → Image → Vector (은폐된 smashed data 생성)
-    공격자가 벡터를 탈취하더라도 원본 텍스트 의미 추론 불가
-    """
-    def __init__(self):
-        super().__init__()
-        # Text → Image → Vector 파이프라인
-        self.text_encoder = BertForSequenceClassification.from_pretrained(
-            'bert-base-uncased', num_labels=2
-        )
-        self.image_generator = nn.Sequential(
-            nn.Linear(768, 1024), nn.ReLU(), nn.BatchNorm1d(1024),
-            nn.Linear(1024, 7 * 32 * 32), nn.Sigmoid()
-        )
-        self.vector_encoder = nn.Sequential(
-            nn.Conv2d(7, 64, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(64),
-            nn.AdaptiveAvgPool2d((4, 4)), nn.Flatten(),
-            nn.Linear(64 * 4 * 4, 768), nn.LayerNorm(768)
-        )
-
-    def forward(self, input_ids, attention_mask):
-        # Text → BERT embedding
-        outputs = self.text_encoder(
-            input_ids=input_ids, attention_mask=attention_mask,
-            output_hidden_states=True
-        )
-        text_embedding = outputs.hidden_states[-1][:, 0, :]
-
-        # BERT embedding → Image
-        image = self.image_generator(text_embedding)
-        image = image.view(-1, 7, 32, 32)
-
-        # Image → Vector (smashed data)
-        smashed_vector = self.vector_encoder(image)
-
-        return smashed_vector
+from circular_obfuscation import CircularObfuscationModel
 
 # 데이터 로드 및 전처리
 print("🔄 Loading voter data for client-side smashed data generation...")
@@ -96,17 +58,19 @@ tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 # 모델이 이미 저장되어 있는지 확인하고, 저장된 모델이 있으면 불러오고 없으면 새로운 모델 생성
 if os.path.exists(model_path):
     # 저장된 모델이 있을 경우 불러오기
-    model = ClientCircularModel()
+    model = CircularObfuscationModel(num_classes=2, use_bert=True)
     try:
-        model.load_state_dict(torch.load(model_path))
-        print("Fine-tuned ClientCircularModel loaded for client-side.")
-    except:
-        print("Warning: Could not load fine-tuned model, using new model...")
-        model = ClientCircularModel()
+        checkpoint = torch.load(model_path)
+        # Fine-tuned 모델은 직접 state_dict로 저장되어 있음 (model_state_dict 키 없음)
+        model.load_state_dict(checkpoint)
+        print("Fine-tuned CircularObfuscationModel loaded for client-side.")
+    except Exception as e:
+        print(f"Warning: Could not load fine-tuned model ({str(e)[:100]}...), using new model...")
+        model = CircularObfuscationModel(num_classes=2, use_bert=True)
 else:
     # 저장된 모델이 없을 경우 새로운 모델 생성
-    model = ClientCircularModel()
-    print("New ClientCircularModel generated for client-side.")
+    model = CircularObfuscationModel(num_classes=2, use_bert=True)
+    print("New CircularObfuscationModel generated for client-side.")
 
 # 입력 데이터를 BERT의 입력 형식으로 변환
 max_len = 128  # 입력 시퀀스의 최대 길이
@@ -167,7 +131,13 @@ for batch_idx, batch in enumerate(dataloader):
     attention_mask = batch[1]
     
     with torch.no_grad():
-        smashed_vector = model(input_ids, attention_mask)
+        outputs = model(input_ids, attention_mask)
+        # CircularObfuscationModel은 (classification_logits, loss, smashed_vector)를 반환
+        if isinstance(outputs, tuple):
+            smashed_vector = outputs[2]  # smashed_vector 추출
+        else:
+            # return_all=True인 경우
+            smashed_vector = outputs['smashed_vector']
 
     # smashed vector를 저장
     hidden_states_list.append(smashed_vector.cpu())
@@ -177,10 +147,13 @@ print(f"✅ Client-side smashed data generation completed in {generation_time:.2
 
 # hidden states를 하나의 텐서로 결합
 hidden_states_concat = torch.cat(hidden_states_list, dim=0)
-hidden_states_concat = hidden_states_concat[:, 0, :].cpu().detach().numpy()
+# smashed_vector는 이미 [batch_size, 768] 형태이므로 [:, 0, :] 제거
+hidden_states_concat = hidden_states_concat.cpu().detach().numpy()
 
-# DataFrame으로 변환 및 CSV 저장
+# DataFrame으로 변환 및 CSV 저장 (voter_id 포함)
+client_voter_ids = [row["voter_id"] for _, row in client_data.iterrows()]
 hidden_states_df = pd.DataFrame(hidden_states_concat)
+hidden_states_df.insert(0, 'voter_id', client_voter_ids[:len(hidden_states_df)])  # voter_id 추가
 hidden_states_df.to_csv("Client_smashed_data.csv", index=False)
 
 print(f"💾 Client-side smashed data saved to 'Client_smashed_data.csv'")

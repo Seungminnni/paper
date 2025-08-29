@@ -9,53 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
-from circular_obfuscation import ServerCircularModel
-
-class ServerCircularModel(nn.Module):
-    """
-    서버 측: Vector → Image → Text (복원 및 분류)
-    공격자가 벡터를 탈취하더라도 복원 모델 없이는 의미 추론 불가
-    """
-    def __init__(self, num_classes=2, vocab_size=30522):
-        super().__init__()
-        # Vector → Image → Text 파이프라인
-        self.vector_decoder = nn.Sequential(
-            nn.Linear(768, 1024),
-            nn.ReLU(),
-            nn.BatchNorm1d(1024),
-            nn.Linear(1024, 7 * 32 * 32),
-            nn.Sigmoid()
-        )
-        self.image_decoder = nn.Sequential(
-            nn.Conv2d(7, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(64),
-            nn.AdaptiveAvgPool2d((8, 8)),
-            nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 768),
-            nn.LayerNorm(768)
-        )
-        self.classifier = nn.Linear(768, num_classes)
-        self.text_decoder = nn.Linear(768, vocab_size)
-
-    def forward(self, smashed_vector, labels=None):
-        # Vector → Image
-        reconstructed_image = self.vector_decoder(smashed_vector)
-        reconstructed_image = reconstructed_image.view(-1, 7, 32, 32)
-
-        # Image → Text embedding
-        text_embedding = self.image_decoder(reconstructed_image)
-
-        # 분류
-        classification_logits = self.classifier(text_embedding)
-
-        # Text tokens (재구성된 텍스트)
-        text_logits = self.text_decoder(text_embedding)
-
-        if labels is not None:
-            loss = F.cross_entropy(classification_logits, labels)
-            return classification_logits, loss, text_logits
-        return classification_logits, text_logits
+from circular_obfuscation import CircularObfuscationModel
 
 # 데이터 로드 및 전처리
 print("🔄 Loading voter data for server-side smashed data generation...")
@@ -104,32 +58,47 @@ tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 # 모델이 이미 저장되어 있는지 확인하고, 저장된 모델이 있으면 불러오고 없으면 새로운 모델 생성
 if os.path.exists(model_path):
     # 저장된 모델이 있을 경우 불러오기
-    model = ServerCircularModel(num_classes=2)
+    model = CircularObfuscationModel(num_classes=2, use_bert=False)
     try:
-        model.load_state_dict(torch.load(model_path))
-        print("Pre-trained ServerCircularModel loaded for server-side.")
-    except:
-        print("Warning: Could not load pre-trained model, using new model...")
-        model = ServerCircularModel(num_classes=2)
+        checkpoint = torch.load(model_path)
+        # Pre-trained 모델은 model_state_dict 키로 저장되어 있는지 확인
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            # 직접 state_dict로 저장된 경우
+            model.load_state_dict(checkpoint)
+        print("Pre-trained CircularObfuscationModel loaded for server-side.")
+    except Exception as e:
+        print(f"Warning: Could not load pre-trained model ({str(e)[:100]}...), using new model...")
+        model = CircularObfuscationModel(num_classes=2, use_bert=False)
 else:
     # 저장된 모델이 없을 경우 새로운 모델 생성
-    model = ServerCircularModel(num_classes=2)
-    print("New ServerCircularModel generated for server-side.")
+    model = CircularObfuscationModel(num_classes=2, use_bert=False)
+    print("New CircularObfuscationModel generated for server-side.")
 
 # ServerCircularModel은 smashed vector를 입력으로 받으므로 토크나이징 불필요
-# 더미 smashed vector 생성 (실제로는 client에서 생성된 vector를 사용)
-print(f"🔄 Generating dummy smashed vectors for server-side testing...")
+# 실제로는 client에서 생성된 smashed vector를 사용해야 함
+# 현재는 테스트를 위해 더미 데이터를 생성하고 있지만,
+# 실제 구현에서는 Client_smashed_data.csv에서 데이터를 로드해야 함
 
-# 더미 smashed vector 생성 (768차원)
-dummy_smashed_vectors = []
-for i in range(len(X_train)):
-    dummy_vector = torch.randn(768)  # 768차원 벡터
-    dummy_smashed_vectors.append(dummy_vector)
+print("🔄 Loading actual smashed vectors from client...")
+try:
+    # Client가 생성한 실제 smashed data 로드
+    client_smashed_df = pd.read_csv("Client_smashed_data.csv")
+    smashed_vectors = torch.tensor(client_smashed_df.values, dtype=torch.float32)
+    print(f"✅ Loaded {len(smashed_vectors)} smashed vectors from Client_smashed_data.csv")
+    print(f"📊 Smashed vector shape: {smashed_vectors.shape}")
+except FileNotFoundError:
+    print("⚠️  Client_smashed_data.csv not found, using dummy data for testing...")
+    # 더미 smashed vector 생성 (테스트용)
+    dummy_smashed_vectors = []
+    for i in range(len(X_train)):
+        dummy_vector = torch.randn(768)  # 768차원 벡터
+        dummy_smashed_vectors.append(dummy_vector)
+    smashed_vectors = torch.stack(dummy_smashed_vectors)
 
-smashed_vectors = torch.stack(dummy_smashed_vectors)
-
-# 더미 라벨 생성
-dummy_labels = torch.zeros(len(X_train), dtype=torch.long)
+# 실제 데이터 수에 맞는 더미 라벨 생성
+dummy_labels = torch.zeros(len(smashed_vectors), dtype=torch.long)
 
 # 데이터셋 생성
 dataset = TensorDataset(smashed_vectors, dummy_labels)
@@ -143,6 +112,9 @@ print(f"Using device for server-side: {device}")
 
 # 모델을 GPU로 이동
 model.to(device)
+
+# 모델 평가 모드로 설정
+model.eval()
 
 # 모델 평가 모드로 설정
 model.eval()
@@ -161,21 +133,33 @@ for batch_idx, batch in enumerate(dataloader):
     labels = batch[1]          # labels
     
     with torch.no_grad():
-        outputs = model(smashed_vector, labels)
+        outputs = model(smashed_vector, None, labels)  # attention_mask=None for server mode
 
-    # 복원된 결과를 저장 (classification_logits, text_logits)
-    classification_logits, text_logits = outputs
-    hidden_states_list.append(classification_logits.cpu())
+    # ServerCircularModel은 (classification_logits, loss, text_logits) 또는 (classification_logits, text_logits)를 반환
+    if len(outputs) == 3:
+        classification_logits, loss, smashed_vector = outputs
+    else:
+        classification_logits, smashed_vector = outputs
+
+    # 실제 smashed vector를 저장 (768차원)
+    hidden_states_list.append(smashed_vector.cpu())
 
 generation_time = time.time() - start_time
 print(f"✅ Smashed data generation completed in {generation_time:.2f}s")
 
 # hidden states를 하나의 텐서로 결합
 hidden_states_concat = torch.cat(hidden_states_list, dim=0)
-hidden_states_concat = hidden_states_concat[:, 0, :].cpu().detach().numpy()
 
-# DataFrame으로 변환 및 CSV 저장
+# classification_logits는 (batch_size, num_classes) 형태이므로 [:, 0, :] 대신 그대로 사용
+# BERT hidden states가 아니므로 차원 조정 불필요
+hidden_states_concat = hidden_states_concat.cpu().detach().numpy()
+
+# DataFrame으로 변환 및 CSV 저장 (voter_id 포함)
+# Client 데이터에서 voter_id 추출
+client_df = pd.read_csv("Client_smashed_data.csv")
+server_voter_ids = client_df['voter_id'].tolist()
 hidden_states_df = pd.DataFrame(hidden_states_concat)
+hidden_states_df.insert(0, 'voter_id', server_voter_ids[:len(hidden_states_df)])  # voter_id 추가
 hidden_states_df.to_csv("Dictionary_smashed_data.csv", index=False)
 
 print(f"💾 Server-side smashed data saved to 'Dictionary_smashed_data.csv'")

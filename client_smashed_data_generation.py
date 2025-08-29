@@ -33,14 +33,24 @@ class CustomBertForSequenceClassification(BertForSequenceClassification):
         return logits, loss, hidden_states
 
 # 데이터 로드 및 전처리
-print("Loading voter data for client-side smashed data generation...")
-data = pd.read_csv("ncvoterb.csv")
+print("🔄 Loading voter data for client-side smashed data generation...")
+data = pd.read_csv("ncvoterb.csv", encoding='latin-1')
+
+# 데이터 크기 제한: 실험을 위해 20,000개로 제한
+# 전체 데이터: 약 224,061개 → 실험용: 20,000개 (약 8.9% 사용)
+SAMPLE_SIZE = 20000
+if len(data) > SAMPLE_SIZE:
+    print(f"📊 Reducing data size from {len(data):,} to {SAMPLE_SIZE:,} for faster experimentation")
+    data = data.sample(n=SAMPLE_SIZE, random_state=42)
+    print(f"✅ Data reduced successfully! Working with {len(data):,} records")
+
+print(f"✅ Data loaded successfully! Total records: {len(data)}")
 
 # 클라이언트 측 데이터로 사용할 샘플 수 (전체의 30%)
+# 실험용 데이터에서 30% = 6,000개 사용
 client_sample_size = int(len(data) * 0.3)
 client_data = data.sample(n=client_sample_size, random_state=123)  # 다른 random_state 사용
-
-print(f"Client-side data size: {len(client_data)}")
+print(f"📊 Client-side data size: {len(client_data)} (30% of {len(data)} = {len(client_data):,})")
 
 # 모델 불러오는 경로 (Fine-tuned 모델)
 model_path = "Fine_tuned_voter_epoch20_BERT_Medium.pt"
@@ -88,16 +98,19 @@ else:
 
 # 입력 데이터를 BERT의 입력 형식으로 변환
 max_len = 128  # 입력 시퀀스의 최대 길이
+print(f"🔄 Tokenizing {len(X_train)} client-side samples...")
 
 input_ids = []
 attention_masks = []
 
-for info in X_train:
+for i, info in enumerate(X_train):
+    if i % 1000 == 0:  # 1000개마다 진행 상황 출력
+        print(f"  Tokenizing sample {i}/{len(X_train)}...")
     encoded_dict = tokenizer.encode_plus(
                         info,                         # 유권자 정보
                         add_special_tokens = True,    # [CLS], [SEP] 토큰 추가
                         max_length = max_len,         # 최대 길이 지정
-                        pad_to_max_length = True,     # 패딩을 추가하여 최대 길이로 맞춤
+                        padding = 'max_length',       # 패딩을 추가하여 최대 길이로 맞춤
                         return_attention_mask = True, # 어텐션 마스크 생성
                         return_tensors = 'pt',        # PyTorch 텐서로 반환
                    )
@@ -105,6 +118,7 @@ for info in X_train:
     input_ids.append(encoded_dict['input_ids'])
     attention_masks.append(encoded_dict['attention_mask'])
 
+print("✅ Client-side tokenization completed!")
 input_ids = torch.cat(input_ids, dim=0)
 attention_masks = torch.cat(attention_masks, dim=0)
 
@@ -128,8 +142,14 @@ model.to(device)
 model.eval()
 hidden_states_list = []  # 평가할 때 hidden state를 저장할 리스트
 
-print("Generating smashed data for client-side...")
-for batch in dataloader:
+print("🔄 Generating smashed data for client-side...")
+import time
+start_time = time.time()
+
+for batch_idx, batch in enumerate(dataloader):
+    if batch_idx % 10 == 0:  # 10배치마다 진행 상황 출력
+        print(f"  Processing batch {batch_idx}/{len(dataloader)}...")
+    
     batch = tuple(t.to(device) for t in batch)
     inputs = {'input_ids': batch[0],
               'attention_mask': batch[1],
@@ -141,6 +161,9 @@ for batch in dataloader:
     hidden_states = outputs[2]
     hidden_states_list.append(hidden_states)
 
+generation_time = time.time() - start_time
+print(f"✅ Client-side smashed data generation completed in {generation_time:.2f}s")
+
 # hidden states를 하나의 텐서로 결합
 hidden_states_concat = torch.cat(hidden_states_list, dim=0)
 hidden_states_concat = hidden_states_concat[:, 0, :].cpu().detach().numpy()
@@ -149,6 +172,6 @@ hidden_states_concat = hidden_states_concat[:, 0, :].cpu().detach().numpy()
 hidden_states_df = pd.DataFrame(hidden_states_concat)
 hidden_states_df.to_csv("Client_smashed_data.csv", index=False)
 
-print(f"Client-side smashed data saved to 'Client_smashed_data.csv'")
-print(f"Shape: {hidden_states_concat.shape}")
-print("Client-side smashed data generation completed!")
+print(f"💾 Client-side smashed data saved to 'Client_smashed_data.csv'")
+print(f"📊 Shape: {hidden_states_concat.shape}")
+print("🎉 Client-side smashed data generation completed successfully!")

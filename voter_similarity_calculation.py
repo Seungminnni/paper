@@ -65,15 +65,26 @@ if __name__ == "__main__":
     print("Loading voter data for similarity calculation...")
 
     # 원본 데이터 로드
-    full_data = pd.read_csv("ncvoterb.csv")
+    full_data = pd.read_csv("ncvoterb.csv", encoding='latin-1')
+
+    # 데이터 크기 제한: 실험을 위해 20,000개로 제한
+    # 전체 데이터: 약 224,061개 → 실험용: 20,000개 (약 8.9% 사용)
+    SAMPLE_SIZE = 20000
+    if len(full_data) > SAMPLE_SIZE:
+        print(f"📊 Reducing data size from {len(full_data):,} to {SAMPLE_SIZE:,} for faster experimentation")
+        full_data = full_data.sample(n=SAMPLE_SIZE, random_state=42)
+        print(f"✅ Data reduced successfully! Working with {len(full_data):,} records")
+
+    print(f"✅ Data loaded successfully! Total records: {len(full_data)}")
 
     # 서버측과 클라이언트 측 데이터 분리 (이전과 동일한 방식)
+    # 실험용 데이터에서 70% 서버, 30% 클라이언트로 분리
     server_sample_size = int(len(full_data) * 0.7)
     server_data = full_data.sample(n=server_sample_size, random_state=42)
     client_data = full_data.drop(server_data.index).sample(frac=1.0, random_state=123)  # 나머지 데이터 사용
 
-    print(f"Server data size: {len(server_data)}")
-    print(f"Client data size: {len(client_data)}")
+    print(f"📊 Server data size: {len(server_data)} (70% of {len(full_data)} = {len(server_data):,})")
+    print(f"📊 Client data size: {len(client_data)} (30% of {len(full_data)} = {len(client_data):,})")
 
     # 변환된 파일 경로
     dictionary_file = "Dictionary_smashed_data.csv"

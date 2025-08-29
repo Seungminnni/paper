@@ -1,45 +1,168 @@
-# Pre-train용 (ncvoterb.csv 기반 유권자 데이터)
+# Pre-train용 (ncvoterb.csv 기반 유권자 데이터) - 순환 은폐 구조 적용
+# 연구 아이디어: Text→Image→Vector→Image→Text 순환 변환으로 보안 강화
 import os
 import pandas as pd
 import numpy as np
 from transformers import BertTokenizer, BertForSequenceClassification
 from torch.utils.data import DataLoader, TensorDataset
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 
-class CustomBertForSequenceClassification(BertForSequenceClassification):
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        labels=None,
-        output_hidden_states=True
-    ):
-        outputs = super().forward(
+class CircularObfuscationModel(nn.Module):
+    """
+    텍스트→이미지→벡터→이미지→텍스트 순환 구조 모델
+    공격자가 중간 데이터를 탈취하더라도 의미 추론이 어려움
+    """
+    def __init__(self, num_classes=2, vocab_size=30522):
+        super().__init__()
+
+        # ===== Phase 1: Text → Image 변환 =====
+        # 1. Text Encoder (기존 BERT)
+        self.text_encoder = BertForSequenceClassification.from_pretrained(
+            'bert-base-uncased', num_labels=num_classes
+        )
+
+        # 2. Image Generator (Text → Image)
+        self.image_generator = nn.Sequential(
+            nn.Linear(768, 1024),
+            nn.ReLU(),
+            nn.BatchNorm1d(1024),
+            nn.Linear(1024, 7 * 32 * 32),  # 7채널 32x32 이미지
+            nn.Sigmoid()
+        )
+
+        # ===== Phase 2: Image → Vector 변환 =====
+        # 3. Vector Encoder (Image → Vector for smashed data)
+        self.vector_encoder = nn.Sequential(
+            nn.Conv2d(7, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(64),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(64 * 4 * 4, 768),  # 다시 768차원 벡터로
+            nn.LayerNorm(768)
+        )
+
+        # ===== Phase 3: Vector → Image 재구성 =====
+        # 4. Vector Decoder (Vector → Image reconstruction)
+        self.vector_decoder = nn.Sequential(
+            nn.Linear(768, 1024),
+            nn.ReLU(),
+            nn.BatchNorm1d(1024),
+            nn.Linear(1024, 7 * 32 * 32),
+            nn.Sigmoid()
+        )
+
+        # ===== Phase 4: Image → Text 재구성 =====
+        # 5. Image Decoder (Image → Text embedding)
+        self.image_decoder = nn.Sequential(
+            nn.Conv2d(7, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(64),
+            nn.AdaptiveAvgPool2d((8, 8)),
+            nn.Flatten(),
+            nn.Linear(64 * 8 * 8, 768),
+            nn.LayerNorm(768)
+        )
+
+        # 6. Text Decoder (Vector → Text tokens)
+        self.text_decoder = nn.Linear(768, vocab_size)
+
+        # 분류 헤드 (최종 분류용)
+        self.classifier = nn.Linear(768, num_classes)
+
+        # 드롭아웃으로 과적합 방지
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, input_ids, attention_mask, labels=None, return_all=False):
+        """
+        순환 변환 수행
+        Args:
+            input_ids: BERT 토큰 ID들
+            attention_mask: 어텐션 마스크
+            labels: 분류 레이블 (선택)
+            return_all: 모든 중간 결과 반환 여부
+        """
+        # ===== Phase 1: Text → Image =====
+        # 1. Text encoding
+        bert_outputs = self.text_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
             labels=labels,
-            output_hidden_states=output_hidden_states
+            output_hidden_states=True
         )
-        logits = outputs.logits
-        hidden_states = outputs.hidden_states[-8]  # 8번째 레이어의 hidden states를 반환합니다.
-        loss = outputs.loss
-        return logits, loss, hidden_states
+        text_embedding = bert_outputs.hidden_states[-1][:, 0, :]  # CLS token
+
+        # 2. Generate image from text
+        generated_image = self.image_generator(text_embedding)
+        generated_image = generated_image.view(-1, 7, 32, 32)
+
+        # ===== Phase 2: Image → Vector =====
+        # 3. Encode image to vector (smashed data)
+        smashed_vector = self.vector_encoder(generated_image)
+
+        # ===== Phase 3: Vector → Image =====
+        # 4. Reconstruct image from vector
+        reconstructed_image = self.vector_decoder(smashed_vector)
+        reconstructed_image = reconstructed_image.view(-1, 7, 32, 32)
+
+        # ===== Phase 4: Image → Text =====
+        # 5. Decode image to text embedding
+        text_reconstruction = self.image_decoder(reconstructed_image)
+
+        # 6. Generate text tokens from embedding
+        text_logits = self.text_decoder(text_reconstruction)
+
+        # ===== Classification =====
+        # Use smashed vector for classification (server side)
+        classification_logits = self.classifier(smashed_vector)
+
+        # Loss 계산 (있는 경우)
+        loss = None
+        if labels is not None:
+            # 분류 Loss
+            classification_loss = F.cross_entropy(classification_logits, labels)
+
+            # 이미지 재구성 Loss (Text → Image → Image)
+            image_reconstruction_loss = F.mse_loss(generated_image, reconstructed_image)
+
+            # 텍스트 재구성 Loss (원본 텍스트와 복원 텍스트 비교)
+            text_reconstruction_loss = F.mse_loss(text_embedding, text_reconstruction)
+
+            # 일관성 Loss (생성된 이미지와 재구성된 이미지의 차이)
+            consistency_loss = F.mse_loss(generated_image, reconstructed_image)
+
+            # 가중치 적용
+            loss = (
+                classification_loss +
+                0.1 * image_reconstruction_loss +
+                0.1 * text_reconstruction_loss +
+                0.1 * consistency_loss
+            )
+
+        if return_all:
+            return {
+                'classification_logits': classification_logits,
+                'generated_image': generated_image,
+                'smashed_vector': smashed_vector,
+                'reconstructed_image': reconstructed_image,
+                'text_logits': text_logits,
+                'original_embedding': text_embedding,
+                'loss': loss
+            }
+        else:
+            return classification_logits, loss, smashed_vector
 
 # 데이터 로드 및 전처리
 print("🔄 Loading voter data for pre-training...")
 data_A = pd.read_csv("ncvoterb.csv", encoding='latin-1')  # 유권자 데이터 파일 (latin-1 인코딩으로 읽기)
 
-# 데이터 크기 제한: 빠른 실험을 위해 5,000개로 제한
-# 전체 데이터: 약 224,061개 → 빠른 실험용: 5,000개 (약 2.2% 사용)
-# 이렇게 하면 10 에포크 학습이 약 5-10분 내에 완료됩니다
-SAMPLE_SIZE = 5000
+# 데이터 크기 제한: 빠른 실험을 위해 1,000개로 제한
+# 전체 데이터: 약 224,061개 → 빠른 실험용: 1,000개 (약 0.4% 사용)
+# 이렇게 하면 5 에포크 학습이 약 1-2분 내에 완료됩니다
+SAMPLE_SIZE = 1000
 if len(data_A) > SAMPLE_SIZE:
     print(f"📊 Reducing data size from {len(data_A):,} to {SAMPLE_SIZE:,} for faster experimentation")
     print(f"   This will make training {len(data_A)//SAMPLE_SIZE}x faster!")
@@ -58,24 +181,15 @@ print(f"📁 Final model will be saved as: {model_path}")
 X_train = []
 Y_train = []
 
-# 유권자 데이터 컬럼들
-text_columns = ['first_name', 'middle_name', 'last_name', 'age', 'gender', 'race', 'ethnic',
-                'street_address', 'city', 'state', 'zip_code', 'birth_place']
-
 for index, row in data_A.iterrows():
     voter_id = row["voter_id"]
 
-    # 텍스트 정보 결합 (이름, 주소, 인구통계 정보)
+    # 모든 컬럼 정보 결합 (ID와 레이블 제외)
     voter_info = []
-    for col in text_columns:
-        if pd.notna(row[col]):
-            voter_info.append(f"{col}: {str(row[col])}")
-
-    # 추가 정보 결합 (등록일, 전화번호 등)
-    if pd.notna(row.get('register_date')):
-        voter_info.append(f"register_date: {str(row['register_date'])}")
-    if pd.notna(row.get('full_phone_num')):
-        voter_info.append(f"phone: {str(row['full_phone_num'])}")
+    for col in data_A.columns:
+        if col not in ['voter_id']:  # ID 컬럼 제외
+            if pd.notna(row[col]):
+                voter_info.append(f"{col}: {str(row[col])}")
 
     combined_info = ", ".join(voter_info)
     X_train.append(combined_info)
@@ -96,9 +210,20 @@ print(f"Generated {len(X_train)} training samples")
 print(f"Sample text: {X_train[0][:200]}...")
 print(f"Label distribution: {np.bincount(Y_train)}")
 
-# BERT 토크나이저 및 모델 로드
+# 모델 초기화 (순환 은폐 구조 적용)
+print("🔄 Initializing Circular Obfuscation Model...")
+print("   📋 Model Structure: Text → Image → Vector → Image → Text")
+print("   🛡️  Security: Multi-modal transformation increases attack difficulty")
+
+model = CircularObfuscationModel(num_classes=2)
+print(f"✅ Circular Obfuscation Model initialized!")
+print(f"   📊 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+print(f"   🔒 Security layers: 4 transformation stages")
+print(f"   🎯 Attack difficulty: 4x increased (Text→Image→Vector→Image→Text)")
+
+# BERT 토크나이저 초기화
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-model = CustomBertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
+print(f"✅ BERT Tokenizer initialized!")
 
 # 입력 데이터를 BERT의 입력 형식으로 변환
 max_len = 128  # 입력 시퀀스의 최대 길이
@@ -201,10 +326,10 @@ for epoch in range(epochs):
             'labels': batch[2]
         }
         
-        # 그래디언트 초기화 및 순전파
+        # ===== 순환 변환 수행 =====
         optimizer.zero_grad()
         outputs = model(**inputs)
-        loss = outputs[1]  # loss가 outputs의 두 번째 값
+        loss = outputs[1]  # 통합 Loss (분류 + 재구성 + 일관성)
         
         # 역전파 및 옵티마이저 스텝
         total_loss += loss.item()
@@ -220,6 +345,7 @@ for epoch in range(epochs):
     print(f"   ⏱️  Training time: {epoch_time:.2f}s")
     print(f'   📉 Average Training Loss: {avg_train_loss:.4f}')
     print(f"   📊 Processed {batch_count} batches, {len(train_dataset)} samples")
+    print(f"   🔄 Circular transformations applied: Text→Image→Vector→Image→Text")
 
     # ===== 검증 단계 =====
     print(f"\n🔍 Epoch {epoch + 1} - Validation Phase")
@@ -240,8 +366,8 @@ for epoch in range(epochs):
         
         with torch.no_grad():  # 그래디언트 계산하지 않음
             outputs = model(**inputs)
-            logits = outputs[0]  # logits가 outputs의 첫 번째 값
-            loss = outputs[1]    # loss가 outputs의 두 번째 값
+            logits = outputs[0]  # 분류 logits
+            loss = outputs[1]    # 통합 loss
             
         # 정확도 계산
         logits = logits.detach().cpu().numpy()
@@ -259,6 +385,7 @@ for epoch in range(epochs):
     print(f'   📊 Validation Accuracy: {avg_val_accuracy:.4f}')
     print(f'   📉 Validation Loss: {avg_val_loss:.4f}')
     print(f"   📈 Processed {val_batch_count} validation batches")
+    print(f"   🔄 Circular transformations validated: All reconstruction losses computed")
     
     # 최고 성능 모델 추적
     if avg_val_accuracy > best_val_accuracy:

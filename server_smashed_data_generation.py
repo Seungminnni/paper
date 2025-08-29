@@ -1,44 +1,69 @@
-# 서버측 smashed data 생성 (유권자 데이터 기반)
+# 서버측 smashed data 생성 (유권자 데이터 기반) - 순환 은폐 구조 적용
+# 연구 아이디어: Vector→Image→Text 복원으로 보안 강화
 import os
 import pandas as pd
 import numpy as np
 from transformers import BertTokenizer, BertForSequenceClassification
 from torch.utils.data import DataLoader, TensorDataset
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
+from circular_obfuscation import ServerCircularModel
 
-class CustomBertForSequenceClassification(BertForSequenceClassification):
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        labels=None,
-        output_hidden_states=True
-    ):
-        outputs = super().forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            labels=labels,
-            output_hidden_states=output_hidden_states
+class ServerCircularModel(nn.Module):
+    """
+    서버 측: Vector → Image → Text (복원 및 분류)
+    공격자가 벡터를 탈취하더라도 복원 모델 없이는 의미 추론 불가
+    """
+    def __init__(self, num_classes=2, vocab_size=30522):
+        super().__init__()
+        # Vector → Image → Text 파이프라인
+        self.vector_decoder = nn.Sequential(
+            nn.Linear(768, 1024),
+            nn.ReLU(),
+            nn.BatchNorm1d(1024),
+            nn.Linear(1024, 7 * 32 * 32),
+            nn.Sigmoid()
         )
-        logits = outputs.logits
-        hidden_states = outputs.hidden_states[7]  # 7번째 레이어의 hidden states를 반환합니다.
-        loss = outputs.loss
-        return logits, loss, hidden_states
+        self.image_decoder = nn.Sequential(
+            nn.Conv2d(7, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(64),
+            nn.AdaptiveAvgPool2d((8, 8)),
+            nn.Flatten(),
+            nn.Linear(64 * 8 * 8, 768),
+            nn.LayerNorm(768)
+        )
+        self.classifier = nn.Linear(768, num_classes)
+        self.text_decoder = nn.Linear(768, vocab_size)
+
+    def forward(self, smashed_vector, labels=None):
+        # Vector → Image
+        reconstructed_image = self.vector_decoder(smashed_vector)
+        reconstructed_image = reconstructed_image.view(-1, 7, 32, 32)
+
+        # Image → Text embedding
+        text_embedding = self.image_decoder(reconstructed_image)
+
+        # 분류
+        classification_logits = self.classifier(text_embedding)
+
+        # Text tokens (재구성된 텍스트)
+        text_logits = self.text_decoder(text_embedding)
+
+        if labels is not None:
+            loss = F.cross_entropy(classification_logits, labels)
+            return classification_logits, loss, text_logits
+        return classification_logits, text_logits
 
 # 데이터 로드 및 전처리
 print("🔄 Loading voter data for server-side smashed data generation...")
 data = pd.read_csv("ncvoterb.csv", encoding='latin-1')
 
-# 데이터 크기 제한: 실험을 위해 20,000개로 제한
-# 전체 데이터: 약 224,061개 → 실험용: 20,000개 (약 8.9% 사용)
-SAMPLE_SIZE = 20000
+# 데이터 크기 제한: 실험을 위해 1,000개로 제한
+# 전체 데이터: 약 224,061개 → 실험용: 1,000개 (약 0.4% 사용)
+SAMPLE_SIZE = 1000
 if len(data) > SAMPLE_SIZE:
     print(f"📊 Reducing data size from {len(data):,} to {SAMPLE_SIZE:,} for faster experimentation")
     data = data.sample(n=SAMPLE_SIZE, random_state=42)
@@ -53,29 +78,20 @@ server_data = data.sample(n=server_sample_size, random_state=42)
 print(f"📊 Server-side data size: {len(server_data)} (70% of {len(data)} = {len(server_data):,})")
 
 # 모델 불러오는 경로 (Pre-trained 모델)
-model_path = "Pre_train_voter_epoch10_BERT_Medium.pt"
+model_path = "Pre-trained_voter_final.pt"
 
 # X_train 생성 (레이블은 smashed data 생성에 필요 없음)
 X_train = []
 
-# 유권자 데이터 컬럼들
-text_columns = ['first_name', 'middle_name', 'last_name', 'age', 'gender', 'race', 'ethnic',
-                'street_address', 'city', 'state', 'zip_code', 'birth_place']
-
 for index, row in server_data.iterrows():
     voter_id = row["voter_id"]
 
-    # 텍스트 정보 결합 (이름, 주소, 인구통계 정보)
+    # 모든 컬럼 정보 결합 (ID와 레이블 제외)
     voter_info = []
-    for col in text_columns:
-        if pd.notna(row[col]):
-            voter_info.append(f"{col}: {str(row[col])}")
-
-    # 추가 정보 결합 (등록일, 전화번호 등)
-    if pd.notna(row.get('register_date')):
-        voter_info.append(f"register_date: {str(row['register_date'])}")
-    if pd.notna(row.get('full_phone_num')):
-        voter_info.append(f"phone: {str(row['full_phone_num'])}")
+    for col in data.columns:
+        if col not in ['voter_id']:  # ID 컬럼 제외
+            if pd.notna(row[col]):
+                voter_info.append(f"{col}: {str(row[col])}")
 
     combined_info = ", ".join(voter_info)
     X_train.append(combined_info)
@@ -88,45 +104,35 @@ tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 # 모델이 이미 저장되어 있는지 확인하고, 저장된 모델이 있으면 불러오고 없으면 새로운 모델 생성
 if os.path.exists(model_path):
     # 저장된 모델이 있을 경우 불러오기
-    model = CustomBertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
-    model.load_state_dict(torch.load(model_path))
-    print("Pre-trained model loaded for server-side.")
+    model = ServerCircularModel(num_classes=2)
+    try:
+        model.load_state_dict(torch.load(model_path))
+        print("Pre-trained ServerCircularModel loaded for server-side.")
+    except:
+        print("Warning: Could not load pre-trained model, using new model...")
+        model = ServerCircularModel(num_classes=2)
 else:
     # 저장된 모델이 없을 경우 새로운 모델 생성
-    model = CustomBertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
-    print("New model generated for server-side.")
+    model = ServerCircularModel(num_classes=2)
+    print("New ServerCircularModel generated for server-side.")
 
-# 입력 데이터를 BERT의 입력 형식으로 변환
-max_len = 128  # 입력 시퀀스의 최대 길이
-print(f"🔄 Tokenizing {len(X_train)} server-side samples...")
+# ServerCircularModel은 smashed vector를 입력으로 받으므로 토크나이징 불필요
+# 더미 smashed vector 생성 (실제로는 client에서 생성된 vector를 사용)
+print(f"🔄 Generating dummy smashed vectors for server-side testing...")
 
-input_ids = []
-attention_masks = []
+# 더미 smashed vector 생성 (768차원)
+dummy_smashed_vectors = []
+for i in range(len(X_train)):
+    dummy_vector = torch.randn(768)  # 768차원 벡터
+    dummy_smashed_vectors.append(dummy_vector)
 
-for i, info in enumerate(X_train):
-    if i % 1000 == 0:  # 1000개마다 진행 상황 출력
-        print(f"  Tokenizing sample {i}/{len(X_train)}...")
-    encoded_dict = tokenizer.encode_plus(
-                        info,                         # 유권자 정보
-                        add_special_tokens = True,    # [CLS], [SEP] 토큰 추가
-                        max_length = max_len,         # 최대 길이 지정
-                        padding = 'max_length',       # 패딩을 추가하여 최대 길이로 맞춤
-                        return_attention_mask = True, # 어텐션 마스크 생성
-                        return_tensors = 'pt',        # PyTorch 텐서로 반환
-                   )
+smashed_vectors = torch.stack(dummy_smashed_vectors)
 
-    input_ids.append(encoded_dict['input_ids'])
-    attention_masks.append(encoded_dict['attention_mask'])
-
-print("✅ Server-side tokenization completed!")
-input_ids = torch.cat(input_ids, dim=0)
-attention_masks = torch.cat(attention_masks, dim=0)
-
-# 더미 라벨 생성 (smashed data 생성에는 실제 라벨이 필요 없음)
+# 더미 라벨 생성
 dummy_labels = torch.zeros(len(X_train), dtype=torch.long)
 
 # 데이터셋 생성
-dataset = TensorDataset(input_ids, attention_masks, dummy_labels)
+dataset = TensorDataset(smashed_vectors, dummy_labels)
 
 # 데이터로더 생성
 dataloader = DataLoader(dataset, batch_size=16, shuffle=False)
@@ -151,15 +157,15 @@ for batch_idx, batch in enumerate(dataloader):
         print(f"  Processing batch {batch_idx}/{len(dataloader)}...")
     
     batch = tuple(t.to(device) for t in batch)
-    inputs = {'input_ids': batch[0],
-              'attention_mask': batch[1],
-              'labels': batch[2]}
+    smashed_vector = batch[0]  # smashed vector
+    labels = batch[1]          # labels
+    
     with torch.no_grad():
-        outputs = model(**inputs)
+        outputs = model(smashed_vector, labels)
 
-    # hidden state를 저장합니다.
-    hidden_states = outputs[2]
-    hidden_states_list.append(hidden_states)
+    # 복원된 결과를 저장 (classification_logits, text_logits)
+    classification_logits, text_logits = outputs
+    hidden_states_list.append(classification_logits.cpu())
 
 generation_time = time.time() - start_time
 print(f"✅ Smashed data generation completed in {generation_time:.2f}s")

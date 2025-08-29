@@ -135,16 +135,6 @@ epochs = 5
 batch_size = 16
 learning_rate = 2e-5
 ```
-
-### 보안 강화 옵션
-```python
-# 노이즈 추가
-noisy_vector = add_obfuscation_noise(vector, noise_factor=0.1)
-
-# 암호화 적용
-encrypted_image = pixel_shuffle_encrypt(image, key=42)
-```
-
 ## 📚 관련 연구
 
 - **Split Learning**: 데이터 분할 학습

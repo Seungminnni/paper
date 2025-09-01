@@ -44,7 +44,7 @@ def main():
     print("📊 Loading data for server-side processing...")
     data_A = pd.read_csv("random_500.csv")  # 500개 샘플 데이터셋
     data_B = pd.read_csv("infected.csv")  # 감염 상태 데이터셋
-    model_path = "Fine_tuned_final_BERT_Based.pt"
+    model_path = "Pre_train_final_BERT_Based.pt"
 
     print(f"📈 Processing {len(data_A)} patient records for server-side")
 

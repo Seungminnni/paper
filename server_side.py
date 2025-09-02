@@ -146,7 +146,7 @@ def main():
         return
 
     smashed_images = np.load(image_file)
-    print(f"-> Loaded a batch of {smashed_images.shape[0]} image arrays.
+    print(f"-> Loaded a batch of {smashed_images.shape[0]} image arrays.")
 
     # 2. 공유 설정 파일 로드
     with open("vector_image_config.json", "r") as f:

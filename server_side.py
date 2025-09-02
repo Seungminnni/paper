@@ -116,47 +116,59 @@ def main():
     model.eval()
     print(f"🖥️  Using device: {device}")
 
-    # Hidden states 추출
-    print("\n🔍 Extracting hidden states for smashed data generation...")
-    hidden_states_list = []
+    # --- 아이디어 적용: 클라이언트로부터 받은 이미지 배열을 벡터로 복원 ---
+    import json
 
-    for batch_idx, batch in enumerate(dataloader):
-        batch = tuple(t.to(device) for t in batch)
-        inputs = {'input_ids': batch[0], 'attention_mask': batch[1], 'labels': batch[2]}
+    def image_to_vector(img, original_dim, vmin, vmax):
+        """
+        절차적으로 생성된 이미지를 원본 벡터로 복원합니다.
+        """
+        img = np.asarray(img, dtype=np.float32)
+        v_padded = img.flatten()
+        v_scaled = v_padded[:original_dim]
+        v_original = v_scaled * (vmax - vmin + 1e-8) + vmin
+        return v_original
 
-        with torch.no_grad():
-            outputs = model(**inputs)
+    # 1. 클라이언트로부터 Smashed Image 배열 수신 (가정)
+    # 실제 구현에서는 네트워크를 통해 수신한 데이터를 역직렬화해야 합니다.
+    # 예: received_data = receive_from_client()
+    #     smashed_images = pickle.loads(received_data)
+    print("☁️  Waiting for data from client...")
+    print("-> (Demonstration mode: Simulating received data)")
+    # 시연을 위해, 클라이언트가 생성했을 법한 임시 데이터 생성
+    # 실제로는 이 부분이 필요 없습니다.
+    with open("vector_image_config.json", "r") as f:
+        temp_config = json.load(f)
+    smashed_images = np.random.rand(10, temp_config["image_side"], temp_config["image_side"], 1).astype(np.float32)
+    print(f"-> Received a batch of {smashed_images.shape[0]} image arrays.")
 
-        hidden_states = outputs[2]  # Custom model의 hidden_states
-        hidden_states_list.append(hidden_states)
+    # 2. 공유 설정 파일 로드
+    with open("vector_image_config.json", "r") as f:
+        config = json.load(f)
 
-        if batch_idx % 5 == 0:
-            print(f"  Processed batch {batch_idx + 1}/{len(dataloader)}")
+    # 3. 이미지 배열을 벡터로 복원 (배치 처리)
+    print("\n🔍 Reconstructing vectors from image arrays...")
+    reconstructed_vectors = []
+    for image_array in smashed_images:
+        vec = image_to_vector(
+            image_array,
+            original_dim=config["original_dim"],
+            vmin=config["vmin"],
+            vmax=config["vmax"]
+        )
+        reconstructed_vectors.append(vec)
 
-    # Hidden states 결합 및 저장
-    print("\n💾 Processing and saving smashed data...")
-    hidden_states_concat = torch.cat(hidden_states_list, dim=0)
-    hidden_states_concat = hidden_states_concat[:, 0, :].cpu().detach().numpy()  # [CLS] 토큰의 hidden states
+    reconstructed_vectors = np.array(reconstructed_vectors, dtype=np.float32)
 
-    hidden_states_df = pd.DataFrame(hidden_states_concat)
-    output_file = "Dictionary_smashed_data_layer2.csv"
-    hidden_states_df.to_csv(output_file, index=False)
+    print(f"✅ Vectors reconstructed successfully.")
+    print(f"   - Vector batch shape: {reconstructed_vectors.shape}")
 
-    print("✅ Server-side smashed data saved successfully!")
-    print(f"📁 Output file: {output_file}")
-    print(f"📊 Data shape: {hidden_states_concat.shape}")
-    print(f"🔢 Features: {hidden_states_concat.shape[1]} dimensions")
-    print(f"📈 Samples: {hidden_states_concat.shape[0]} patients")
+    # 4. 복원된 벡터를 서버의 다음 로직에 사용
+    # 예: pre-train 모델의 입력으로 사용하거나, DB와 유사도 비교 등
+    print("\n➡️  Passing reconstructed vectors to the next server-side logic...")
+    # server_model.predict(reconstructed_vectors)
 
-    # 통계 정보 출력
-    print("\n📊 Smashed Data Statistics:")
-    print(f"   • Mean: {np.mean(hidden_states_concat):.6f}")
-    print(f"   • Std: {np.std(hidden_states_concat):.6f}")
-    print(f"   • Min: {np.min(hidden_states_concat):.6f}")
-    print(f"   • Max: {np.max(hidden_states_concat):.6f}")
-
-    print("\n🎉 Server-side smashed data generation completed!")
-    print("🔒 Data is now anonymized and ready for privacy-preserving analysis")
+    print("\n🎉 Server-side process completed!")
 
 if __name__ == "__main__":
     main()

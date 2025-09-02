@@ -133,30 +133,63 @@ def main():
         if batch_idx % 5 == 0:
             print(f"  Processed batch {batch_idx + 1}/{len(dataloader)}")
 
-    # Hidden states 결합 및 저장
-    print("\n💾 Processing and saving smashed data...")
+    # Hidden states 결합
+    print("\n💾 Processing and converting smashed data to image array...")
     hidden_states_concat = torch.cat(hidden_states_list, dim=0)
     hidden_states_concat = hidden_states_concat[:, 0, :].cpu().detach().numpy()  # [CLS] 토큰의 hidden states
 
-    hidden_states_df = pd.DataFrame(hidden_states_concat)
-    output_file = "Client_smashed_data_layer2.csv"
-    hidden_states_df.to_csv(output_file, index=False)
+    # --- 아이디어 적용: 벡터를 이미지 배열로 변환 ---
+    import json
 
-    print("✅ Client-side smashed data saved successfully!")
-    print(f"📁 Output file: {output_file}")
-    print(f"📊 Data shape: {hidden_states_concat.shape}")
-    print(f"🔢 Features: {hidden_states_concat.shape[1]} dimensions")
-    print(f"📈 Samples: {hidden_states_concat.shape[0]} patients")
+    def vector_to_image(v, side=None, vmin=None, vmax=None, robust=False, cmap=None):
+        v = np.asarray(v, dtype=np.float32).copy()
+        if robust:
+            lo, hi = np.percentile(v, [1, 99])
+            v = np.clip(v, lo, hi)
+            vmin, vmax = lo, hi
+        else:
+            assert vmin is not None and vmax is not None, "train에서 얻은 vmin/vmax를 넘겨주세요."
+        v = (v - vmin) / (vmax - vmin + 1e-8)
+        v = np.clip(v, 0.0, 1.0)
+        if side is None:
+            side = int(np.ceil(np.sqrt(len(v))))
+        pad = side*side - len(v)
+        if pad > 0:
+            v = np.pad(v, (0, pad), constant_values=0.0)
+        img = v.reshape(side, side, 1)
+        if cmap is not None:
+            import matplotlib.cm as cm
+            rgb = cm.get_cmap(cmap)(img[..., 0])[..., :3]
+            return rgb.astype(np.float32)
+        return img
 
-    # 통계 정보 출력
-    print("\n📊 Smashed Data Statistics:")
-    print(f"   • Mean: {np.mean(hidden_states_concat):.6f}")
-    print(f"   • Std: {np.std(hidden_states_concat):.6f}")
-    print(f"   • Min: {np.min(hidden_states_concat):.6f}")
-    print(f"   • Max: {np.max(hidden_states_concat):.6f}")
+    # 1. 공유 설정 파일 로드
+    with open("vector_image_config.json", "r") as f:
+        config = json.load(f)
 
-    print("\n🎉 Client-side smashed data generation completed!")
-    print("🔒 Data is now anonymized and ready for privacy-preserving analysis")
+    # 2. 벡터를 이미지 배열로 변환 (배치 처리)
+    smashed_images = []
+    for vector in hidden_states_concat:
+        img = vector_to_image(
+            vector,
+            side=config["image_side"],
+            vmin=config["vmin"],
+            vmax=config["vmax"]
+        )
+        smashed_images.append(img)
+
+    smashed_images = np.array(smashed_images, dtype=np.float32)
+
+    print(f"🖼️  Smashed data converted to image arrays.")
+    print(f"   - Array batch shape: {smashed_images.shape}")
+    print(f"   - Data type: {smashed_images.dtype}")
+
+    # 3. 생성된 이미지 배열을 서버로 전송
+    # 이 단계에서 `smashed_images` 배열을 직렬화(예: pickle)하여
+    # 네트워크를 통해 서버로 전송하는 로직을 구현해야 합니다.
+    # 예: send_to_server(pickle.dumps(smashed_images))
+    print("\n🎉 Client-side process completed!")
+    print("🔒 Smashed image arrays are ready to be sent to the server.")
 
 if __name__ == "__main__":
     main()

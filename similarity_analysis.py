@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Smashed Data Similarity Analysis
-클라이언트와 서버 smashed data의 유사도 분석
+Pipeline Information-Loss Analysis
+(Before) Original vs (After) Restored Smashed Data
 """
 
 import pandas as pd
@@ -18,130 +18,86 @@ def load_smashed_data(file_path):
     print(f"📊 Loaded {vectors.shape[0]} vectors of dimension {vectors.shape[1]} from {file_path}")
     return vectors
 
-def calculate_similarity_stats(client_vectors, server_vectors):
-    """두 데이터셋 간 유사도 통계 계산"""
-    print("\n🔍 Calculating similarity statistics...")
+def calculate_direct_similarity(original_vectors, restored_vectors):
+    """두 데이터셋의 각 벡터를 1:1로 비교하여 유사도 통계 계산"""
+    print("\n🔍 Calculating 1-to-1 similarity statistics...")
 
-    similarities = []
-
-    # 각 클라이언트 벡터에 대해 가장 유사한 서버 벡터 찾기
-    for client_vec in client_vectors:
-        # 코사인 유사도 계산
-        sim_scores = cosine_similarity([client_vec], server_vectors)[0]
-        max_sim = np.max(sim_scores)
-        similarities.append(max_sim)
+    # 각 쌍의 코사인 유사도를 직접 계산
+    similarities = [
+        cosine_similarity([original], [restored])[0][0] 
+        for original, restored in zip(original_vectors, restored_vectors)
+    ]
 
     similarities = np.array(similarities)
 
-    print("📈 Similarity Statistics:")
-    print(f"   • Mean similarity: {np.mean(similarities):.4f}")
-    print(f"   • Median similarity: {np.median(similarities):.4f}")
-    print(f"   • Std similarity: {np.std(similarities):.4f}")
-    print(f"   • Min similarity: {np.min(similarities):.4f}")
-    print(f"   • Max similarity: {np.max(similarities):.4f}")
+    print("📈 Similarity Statistics (Original vs. Restored):")
+    print(f"   • Mean similarity: {np.mean(similarities):.6f}")
+    print(f"   • Median similarity: {np.median(similarities):.6f}")
+    print(f"   • Std Dev similarity: {np.std(similarities):.6f}")
+    print(f"   • Min similarity: {np.min(similarities):.6f} (Most information loss)")
+    print(f"   • Max similarity: {np.max(similarities):.6f} (Least information loss)")
 
     return similarities
 
 def plot_similarity_distribution(similarities):
     """유사도 분포 시각화"""
-    try:
-        plt.figure(figsize=(10, 6))
-
-        # 모든 값이 같으면 특별 처리
-        if np.std(similarities) == 0:
-            plt.bar([0.5], [len(similarities)], width=0.1, alpha=0.7, color='blue')
-            plt.title('All Similarities are Identical (Value = 1.0)')
-            plt.xlabel('Cosine Similarity')
-            plt.ylabel('Count')
-            plt.xticks([0.5], ['1.0'])
-        else:
-            plt.hist(similarities, bins=30, alpha=0.7, color='blue', edgecolor='black')
-            plt.title('Distribution of Cosine Similarities between Client and Server Vectors')
-            plt.xlabel('Cosine Similarity')
-            plt.ylabel('Frequency')
-
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('similarity_distribution.png', dpi=300, bbox_inches='tight')
-        print("✅ Plot saved as 'similarity_distribution.png'")
-    except Exception as e:
-        print(f"⚠️ Plotting failed: {e}")
-    finally:
-        plt.close('all')  # 모든 플롯 닫기
-
-def analyze_vector_clusters(client_vectors, server_vectors):
-    """벡터 클러스터 분석"""
-    print("\n🎯 Analyzing vector clusters...")
-
-    # 각 데이터셋의 평균 벡터 계산
-    client_mean = np.mean(client_vectors, axis=0)
-    server_mean = np.mean(server_vectors, axis=0)
-
-    # 평균 벡터 간 유사도
-    mean_similarity = cosine_similarity([client_mean], [server_mean])[0][0]
-    print(f"📊 Mean vector similarity: {mean_similarity:.4f}")
-
-    # 각 데이터셋 내 분산
-    client_variance = np.var(client_vectors, axis=0).mean()
-    server_variance = np.var(server_vectors, axis=0).mean()
-
-    print(f"📊 Client data variance: {client_variance:.6f}")
-    print(f"📊 Server data variance: {server_variance:.6f}")
-
-    return mean_similarity, client_variance, server_variance
+    plt.figure(figsize=(10, 6))
+    plt.hist(similarities, bins=50, alpha=0.75, color='green', edgecolor='black')
+    plt.title('Distribution of Cosine Similarities (Original vs. Restored Vectors)')
+    plt.xlabel('Cosine Similarity (1.0 = Perfect Reconstruction)')
+    plt.ylabel('Frequency')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('information_loss_distribution.png', dpi=300)
+    print("\n✅ Plot saved as 'information_loss_distribution.png'")
+    plt.close()
 
 def main():
-    print("🔬 Smashed Data Similarity Analysis")
+    print("🔬 Pipeline Information-Loss Analysis")
     print("=" * 60)
 
     # 데이터 로드
-    client_file = "Client_smashed_data_layer2.csv"
-    server_file = "Dictionary_smashed_data_layer2.csv"
+    original_file = "Client_smashed_data_layer2.csv"
+    restored_file = "restored_client_vectors.csv"
 
     try:
-        client_vectors = load_smashed_data(client_file)
-        server_vectors = load_smashed_data(server_file)
+        original_vectors = load_smashed_data(original_file)
+        restored_vectors = load_smashed_data(restored_file)
     except FileNotFoundError as e:
         print(f"❌ Error: {e}")
+        print("Please run the full pipeline (client_smashed_data_generation.py -> ... -> server_side.py) first.")
         return
 
-    # 유사도 분석
-    similarities = calculate_similarity_stats(client_vectors, server_vectors)
+    if len(original_vectors) != len(restored_vectors):
+        print("❌ Error: The number of vectors in both files do not match.")
+        return
 
-    # 클러스터 분석
-    mean_sim, client_var, server_var = analyze_vector_clusters(client_vectors, server_vectors)
+    # 1:1 유사도 분석
+    similarities = calculate_direct_similarity(original_vectors, restored_vectors)
 
-    # 시각화 (모든 값이 같으면 생략)
-    if np.std(similarities) > 0:
-        print("\n📊 Generating similarity distribution plot...")
+    if similarities is not None:
+        # 시각화
         plot_similarity_distribution(similarities)
-    else:
-        print("\n📊 All similarities are identical (1.0) - skipping plot")
 
-    # 결과 요약
-    print("\n🎉 Analysis Complete!")
-    print("=" * 60)
-    print("📋 Summary:")
-    print(f"   • Client samples: {client_vectors.shape[0]}")
-    print(f"   • Server samples: {server_vectors.shape[0]}")
-    print(f"   • Average similarity: {np.mean(similarities):.4f}")
-    print(f"   • Mean vector similarity: {mean_sim:.4f}")
-    print(f"   • Client variance: {client_var:.6f}")
-    print(f"   • Server variance: {server_var:.6f}")
+        # 결과 요약
+        print("\n🎉 Analysis Complete!")
+        print("=" * 60)
+        print("📋 Summary of Pipeline Information Loss:")
+        print(f"   • Compared {len(similarities)} pairs of vectors.")
+        print(f"   • Average Cosine Similarity: {np.mean(similarities):.6f}")
+        print(f"   • Minimum Similarity (Worst Case): {np.min(similarities):.6f}")
 
-    # 해석
-    print("\n💡 Interpretation:")
-    if np.mean(similarities) > 0.8:
-        print("   • High similarity: Data distributions are very similar")
-    elif np.mean(similarities) > 0.6:
-        print("   • Moderate similarity: Some overlap in data distributions")
-    else:
-        print("   • Low similarity: Data distributions are quite different")
-
-    if abs(client_var - server_var) < 0.01:
-        print("   • Similar variance: Data spread is comparable")
-    else:
-        print("   • Different variance: Data spread differs between client and server")
+        # 해석
+        print("\n💡 Interpretation:")
+        mean_sim = np.mean(similarities)
+        if mean_sim > 0.9999:
+            print("   • Excellent: The image conversion pipeline causes negligible information loss.")
+        elif mean_sim > 0.99:
+            print("   • Good: The pipeline causes very minor information loss.")
+        elif mean_sim > 0.95:
+            print("   • Moderate: The pipeline causes some information loss, which might affect performance.")
+        else:
+            print("   • High: The pipeline significantly distorts the data.")
 
 if __name__ == "__main__":
     main()

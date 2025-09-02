@@ -46,11 +46,7 @@ def main():
     data_A = pd.read_csv("output1.csv")  # 환자 정보 데이터셋
     data_B = pd.read_csv("infected.csv")  # 감염 상태 데이터셋
 
-    # 샘플링
-    SAMPLE_SIZE = 1000
-    if len(data_A) > SAMPLE_SIZE:
-        data_A = data_A.sample(n=SAMPLE_SIZE, random_state=42)
-        print(f"📈 Sampled {SAMPLE_SIZE} patients from dataset")
+    
 
     # X_train, Y_train 생성
     X_train = []

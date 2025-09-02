@@ -79,12 +79,11 @@ def main():
     print(f"   - Array batch shape: {smashed_images.shape}")
     print(f"   - Data type: {smashed_images.dtype}")
 
-    # 4. 생성된 이미지 배열을 서버로 전송 (시뮬레이션)
-    # 이 단계에서 `smashed_images` 배열을 직렬화(예: pickle)하여
-    # 네트워크를 통해 서버로 전송하는 로직을 구현해야 합니다.
-    # 예: send_to_server(pickle.dumps(smashed_images))
-    print("\n🎉 Client-side process completed!")
-    print("🔒 Smashed image arrays are ready to be sent to the server.")
+    # 4. 생성된 이미지 배열을 파일로 저장하여 서버로 전달
+    output_file = "smashed_images.npy"
+    np.save(output_file, smashed_images)
+    print(f"\n🎉 Client-side process completed!")
+    print(f"🔒 Smashed image arrays saved to '{output_file}' for the server.")
 
 if __name__ == "__main__":
     main()

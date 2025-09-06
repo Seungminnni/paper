@@ -1,7 +1,0 @@
-{
-    "python.defaultInterpreterPath": "/Users/seungmin/Desktop/논문/paper/.venv/bin/python",
-    "python.terminal.activateEnvironment": true,
-    "python.languageServer": "Pylance",
-    "python.linting.enabled": false,
-    "python.analysis.typeCheckingMode": "off"
-}
